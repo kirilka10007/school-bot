@@ -1,0 +1,24 @@
+from aiogram.fsm.state import State, StatesGroup
+
+
+class ApplicationForm(StatesGroup):
+    user_type = State()
+    menu = State()
+
+    teacher_subject = State()
+    teacher_card = State()
+    review_card = State()
+
+    payment_proof = State()
+    payment_manual_amount = State()
+
+    name = State()
+    school_class = State()
+    goal = State()
+    lesson_type = State()
+    subjects = State()
+    teacher_choice = State()
+    teacher_name = State()
+    contact_method = State()
+    contact_value = State()
+    comment = State()
