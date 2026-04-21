@@ -1,5 +1,6 @@
 import sqlite3
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -114,8 +115,103 @@ def init_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS maintenance_runs (
+            task_name TEXT PRIMARY KEY,
+            executed_at TEXT NOT NULL
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
+
+
+def _is_truthy_env(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def reset_student_data_for_testing(preserve_superadmin_ids: list[int] | tuple[int, ...] | None = None):
+    preserve_superadmin_ids = tuple(preserve_superadmin_ids or [])
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("BEGIN")
+
+    cur.execute(
+        """
+        DELETE FROM attendance
+        WHERE student_lesson_id IN (SELECT id FROM student_lessons)
+        """
+    )
+    cur.execute(
+        """
+        DELETE FROM balance_history
+        WHERE student_lesson_id IN (SELECT id FROM student_lessons)
+        """
+    )
+    cur.execute("DELETE FROM student_lessons")
+    cur.execute("DELETE FROM payment_requests")
+    cur.execute("DELETE FROM admin_actions")
+    cur.execute("DELETE FROM students")
+    cur.execute("DELETE FROM users WHERE role = 'student'")
+    cur.execute("DELETE FROM users WHERE role = 'admin'")
+
+    if preserve_superadmin_ids:
+        placeholders = ",".join("?" for _ in preserve_superadmin_ids)
+        cur.execute(
+            f"""
+            DELETE FROM users
+            WHERE role = 'superadmin'
+              AND telegram_id NOT IN ({placeholders})
+            """,
+            preserve_superadmin_ids,
+        )
+    else:
+        cur.execute("DELETE FROM users WHERE role = 'superadmin'")
+
+    conn.commit()
+    conn.close()
+
+
+def run_startup_maintenance_from_env(preserve_superadmin_ids: list[int] | tuple[int, ...] | None = None) -> bool:
+    if not _is_truthy_env(os.getenv("SCHOOL_RESET_STUDENT_DATA")):
+        return False
+
+    task_name = "reset_student_data_for_testing_v1"
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1
+        FROM maintenance_runs
+        WHERE task_name = ?
+        """,
+        (task_name,),
+    )
+    already_executed = cur.fetchone() is not None
+    conn.close()
+
+    if already_executed:
+        return False
+
+    reset_student_data_for_testing(preserve_superadmin_ids=preserve_superadmin_ids)
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO maintenance_runs (task_name, executed_at)
+        VALUES (?, ?)
+        """,
+        (task_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+    conn.close()
+    return True
 
 
 def add_student(full_name: str, telegram_id: int | None, phone: str | None):
