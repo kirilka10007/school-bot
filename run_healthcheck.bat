@@ -2,14 +2,11 @@
 setlocal
 
 set ROOT=%~dp0
-set PYTHON=%ROOT%school-bot\venv\Scripts\python.exe
+set PYTHON=C:\Users\Den\AppData\Local\Programs\Python\Python313\python.exe
+set PYTHONPATH=%ROOT%.python_packages;%ROOT%
 
 if not exist "%PYTHON%" (
-  set PYTHON=%ROOT%school_admin_bot\venv\Scripts\python.exe
-)
-
-if not exist "%PYTHON%" (
-  echo [ERROR] Python not found in school-bot or school_admin_bot venv
+  echo [ERROR] Python not found: %PYTHON%
   exit /b 1
 )
 

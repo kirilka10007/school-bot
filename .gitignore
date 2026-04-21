@@ -10,6 +10,7 @@ __pycache__/
 .ruff_cache/
 logs/
 *.log
+.python_packages/
 *.sqlite3
 *.db
 shared/*.db
