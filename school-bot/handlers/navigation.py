@@ -5,16 +5,21 @@ from aiogram.types import CallbackQuery, Message
 
 from data import TEACHERS_DATA, load_reviews_from_folder
 from keyboards import (
-    get_user_type_keyboard,
     get_main_menu_keyboard,
     get_teacher_subject_keyboard,
+    get_user_type_keyboard,
 )
-from shared.database import find_students_by_telegram_id, get_student_directions
+from shared.database import (
+    find_students_by_telegram_id,
+    get_recent_payment_history_by_telegram_user,
+    get_student_directions,
+)
 from states import ApplicationForm
 
 from .common import (
     build_cabinet_text,
     build_multi_students_warning,
+    build_recent_payments_text,
     edit_review_card,
     edit_teacher_card,
     send_review_card,
@@ -29,7 +34,8 @@ router = Router()
 async def start_handler(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "Привет! Кто будет оставлять заявку?", reply_markup=get_user_type_keyboard()
+        "Здравствуйте! Пожалуйста, укажите, кто будет оставлять заявку.",
+        reply_markup=get_user_type_keyboard(),
     )
     await state.set_state(ApplicationForm.user_type)
 
@@ -43,7 +49,8 @@ async def choose_user_type(callback: CallbackQuery, state: FSMContext):
     await state.update_data(user_type=user_type_map[callback.data])
 
     await callback.message.answer(
-        "Отлично. Теперь выбери раздел:", reply_markup=get_main_menu_keyboard()
+        "Благодарим. Теперь, пожалуйста, выберите раздел:",
+        reply_markup=get_main_menu_keyboard(),
     )
     await state.set_state(ApplicationForm.menu)
     await callback.answer()
@@ -58,7 +65,8 @@ async def back_to_menu(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(ApplicationForm.menu, lambda c: c.data == "menu_teachers")
 async def menu_teachers(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
-        "Выбери предмет:", reply_markup=get_teacher_subject_keyboard()
+        "Пожалуйста, выберите предмет:",
+        reply_markup=get_teacher_subject_keyboard(),
     )
     await state.set_state(ApplicationForm.teacher_subject)
     await callback.answer()
@@ -84,29 +92,33 @@ async def menu_cabinet(callback: CallbackQuery, state: FSMContext):
 
     if not students:
         await callback.message.answer(
-            "Мы пока не нашли тебя в базе учеников.\n"
-            "Напиши администратору, чтобы привязать Telegram ID к твоей карточке."
+            "Мы пока не нашли Вас в базе учеников.\n"
+            "Пожалуйста, обратитесь к администратору, чтобы привязать Telegram ID к Вашей карточке."
         )
         await callback.answer()
         return
 
     student_id, student_name, _, _ = students[0]
     directions = get_student_directions(student_id)
+    recent_payments = get_recent_payment_history_by_telegram_user(
+        callback.from_user.id,
+        limit=4,
+    )
 
     if not directions:
         warning = build_multi_students_warning(len(students))
         await callback.message.answer(
             f"👤 <b>Личный кабинет</b>\n\n"
             f"<b>Ученик:</b> {student_name}\n"
-            f"Пока нет активных направлений.{warning}",
+            f"Активные направления пока отсутствуют.\n\n"
+            f"{build_recent_payments_text(recent_payments)}{warning}",
             parse_mode="HTML",
         )
         await callback.answer()
         return
 
-    text = build_cabinet_text(student_name, directions) + build_multi_students_warning(
-        len(students)
-    )
+    text = build_cabinet_text(student_name, directions, recent_payments)
+    text += build_multi_students_warning(len(students))
     await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
@@ -135,7 +147,10 @@ async def choose_teacher_subject(callback: CallbackQuery, state: FSMContext):
     subject = callback.data.split("teacher_subject_", 1)[1]
     teachers = TEACHERS_DATA.get(subject, [])
     if not teachers:
-        await callback.answer("По этому предмету пока нет преподавателей", show_alert=True)
+        await callback.answer(
+            "По этому предмету преподаватели пока не добавлены.",
+            show_alert=True,
+        )
         return
 
     await send_teacher_card(callback.message, subject, 0, state)
@@ -180,6 +195,6 @@ async def signup_from_teacher_card(callback: CallbackQuery, state: FSMContext):
         teacher_name=teacher["name"],
     )
 
-    await callback.message.answer("Как тебя зовут?")
+    await callback.message.answer("Пожалуйста, напишите, как к Вам обращаться.")
     await state.set_state(ApplicationForm.name)
     await callback.answer()

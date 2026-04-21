@@ -37,6 +37,7 @@ from shared.database import (
     bind_teacher_telegram_id,
     log_admin_action,
     get_recent_admin_actions,
+    get_recent_payment_history_by_telegram_user,
 )
 
 router = Router()
@@ -1129,6 +1130,56 @@ async def student_profile(callback: CallbackQuery):
         f"🆔 <b>Telegram ID:</b> <code>{student_telegram_id if student_telegram_id else '-'}</code>",
         parse_mode="HTML"
     )
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "student_payment_history")
+async def student_payment_history(callback: CallbackQuery):
+    user = get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    _, _, _, role, is_active = user
+
+    if role != "student" or not is_active:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    student = get_student_by_telegram_id(callback.from_user.id)
+    if not student:
+        await callback.message.answer(
+            "Профиль ученика пока не найден в базе.\n"
+            "Пожалуйста, обратитесь к администратору."
+        )
+        await callback.answer()
+        return
+
+    _, student_name, _, _ = student
+    payments = get_recent_payment_history_by_telegram_user(callback.from_user.id, limit=4)
+
+    lines = [f"💳 <b>История оплат</b>\n\n👤 <b>{student_name}</b>\n"]
+
+    if not payments:
+        lines.append("\nИстория оплат пока отсутствует.")
+    else:
+        status_map = {
+            "pending": "Ожидает проверки",
+            "processing": "На проверке",
+            "approved": "Подтверждена",
+            "rejected": "Отклонена",
+        }
+        for index, payment in enumerate(payments, start=1):
+            payment_id, status, caption_text, created_at, _updated_at, lessons_added = payment
+            lines.append(
+                f"\n{index}. Оплата #{payment_id}\n"
+                f"Статус: <b>{status_map.get(status, status)}</b>\n"
+                f"Дата: {created_at}\n"
+                f"Начислено занятий: <b>{lessons_added}</b>\n"
+                f"Комментарий: {caption_text if caption_text else '-'}"
+            )
+
+    await callback.message.answer("".join(lines), parse_mode="HTML")
     await callback.answer()
 
 

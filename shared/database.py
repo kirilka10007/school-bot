@@ -624,6 +624,40 @@ def get_payment_request_by_id(payment_request_id: int):
     return row
 
 
+def get_recent_payment_history_by_telegram_user(telegram_user_id: int, limit: int = 4):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT
+            pr.id,
+            pr.status,
+            pr.caption_text,
+            pr.created_at,
+            pr.updated_at,
+            COALESCE(
+                (
+                    SELECT SUM(bh.lessons_delta)
+                    FROM balance_history bh
+                    WHERE bh.operation_type = 'manual_topup'
+                      AND bh.comment LIKE '%' || '#' || pr.id || '%'
+                ),
+                0
+            ) AS lessons_added
+        FROM payment_requests pr
+        WHERE pr.telegram_user_id = ?
+        ORDER BY pr.id DESC
+        LIMIT ?
+        """,
+        (telegram_user_id, limit),
+    )
+    rows = cur.fetchall()
+
+    conn.close()
+    return rows
+
+
 def update_payment_request_status(payment_request_id: int, status: str, admin_id: int | None = None):
     conn = get_connection()
     cur = conn.cursor()

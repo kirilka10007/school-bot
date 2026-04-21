@@ -1,4 +1,4 @@
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from data import TEACHERS_DATA
 
@@ -38,11 +38,11 @@ def get_user_type_keyboard():
 
 def get_main_menu_keyboard():
     buttons = [
-        [InlineKeyboardButton(text="Записаться", callback_data="menu_signup")],
+        [InlineKeyboardButton(text="Оставить заявку", callback_data="menu_signup")],
         [InlineKeyboardButton(text="Преподаватели", callback_data="menu_teachers")],
         [InlineKeyboardButton(text="Отзывы", callback_data="menu_reviews")],
-        [InlineKeyboardButton(text="Мой кабинет", callback_data="menu_cabinet")],
-        [InlineKeyboardButton(text="Я оплатил", callback_data="menu_paid")],
+        [InlineKeyboardButton(text="Личный кабинет", callback_data="menu_cabinet")],
+        [InlineKeyboardButton(text="Отправить чек об оплате", callback_data="menu_paid")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -70,7 +70,7 @@ def get_teacher_card_keyboard(index: int, total: int):
     if nav_buttons:
         buttons.append(nav_buttons)
 
-    buttons.append([InlineKeyboardButton(text="Записаться", callback_data="teacher_signup")])
+    buttons.append([InlineKeyboardButton(text="Оставить заявку", callback_data="teacher_signup")])
     buttons.append([InlineKeyboardButton(text="В меню", callback_data="back_to_menu")])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -200,7 +200,7 @@ def get_payment_direction_keyboard(payment_request_id: int, directions):
     buttons = []
 
     for direction in directions:
-        direction_id, teacher_name, subject_name, lesson_balance, tariff_type = direction
+        direction_id, teacher_name, subject_name, lesson_balance, _tariff_type = direction
         buttons.append(
             [
                 InlineKeyboardButton(
@@ -238,7 +238,7 @@ def get_payment_topup_keyboard(payment_request_id: int, direction_id: int):
             ],
             [
                 InlineKeyboardButton(
-                    text="Вручную",
+                    text="Указать вручную",
                     callback_data=f"paymanual_{payment_request_id}_{direction_id}",
                 )
             ],

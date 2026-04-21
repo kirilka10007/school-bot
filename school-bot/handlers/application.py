@@ -33,7 +33,7 @@ async def menu_signup(callback: CallbackQuery, state: FSMContext):
     if user_type:
         await state.update_data(user_type=user_type)
 
-    await callback.message.answer("Как тебя зовут?")
+    await callback.message.answer("Пожалуйста, напишите, как к Вам обращаться.")
     await state.set_state(ApplicationForm.name)
     await callback.answer()
 
@@ -44,34 +44,41 @@ async def back_step(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
 
     if current_state == ApplicationForm.school_class.state:
-        await callback.message.answer("Как тебя зовут?")
+        await callback.message.answer("Пожалуйста, напишите, как к Вам обращаться.")
         await state.set_state(ApplicationForm.name)
 
     elif current_state == ApplicationForm.goal.state:
-        await callback.message.answer("Выбери класс:", reply_markup=get_class_keyboard())
+        await callback.message.answer(
+            "Пожалуйста, выберите класс:",
+            reply_markup=get_class_keyboard(),
+        )
         await state.set_state(ApplicationForm.school_class)
 
     elif current_state == ApplicationForm.lesson_type.state:
-        await callback.message.answer("Выбери цель обучения:", reply_markup=get_goal_keyboard())
+        await callback.message.answer(
+            "Пожалуйста, выберите цель обучения:",
+            reply_markup=get_goal_keyboard(),
+        )
         await state.set_state(ApplicationForm.goal)
 
     elif current_state == ApplicationForm.subjects.state:
         await callback.message.answer(
-            "Выбери тип занятия:", reply_markup=get_lesson_type_keyboard()
+            "Пожалуйста, выберите формат занятий:",
+            reply_markup=get_lesson_type_keyboard(),
         )
         await state.set_state(ApplicationForm.lesson_type)
 
     elif current_state == ApplicationForm.teacher_choice.state:
         subjects = data.get("subjects", [])
         await callback.message.answer(
-            "Выбери один или несколько предметов, затем нажми «Готово»:",
+            "Пожалуйста, выберите один или несколько предметов, затем нажмите «Готово»:",
             reply_markup=get_subjects_keyboard(subjects),
         )
         await state.set_state(ApplicationForm.subjects)
 
     elif current_state == ApplicationForm.teacher_name.state:
         await callback.message.answer(
-            "Выбери вариант с преподавателем:",
+            "Пожалуйста, выберите вариант с преподавателем:",
             reply_markup=get_teacher_choice_keyboard(),
         )
         await state.set_state(ApplicationForm.teacher_choice)
@@ -82,26 +89,28 @@ async def back_step(callback: CallbackQuery, state: FSMContext):
 
         if from_teacher_card:
             await callback.message.answer(
-                "Выбери тип занятия:", reply_markup=get_lesson_type_keyboard()
+                "Пожалуйста, выберите формат занятий:",
+                reply_markup=get_lesson_type_keyboard(),
             )
             await state.set_state(ApplicationForm.lesson_type)
 
         elif teacher_choice == "Выбрать конкретного":
             await callback.message.answer(
-                "Выбери преподавателя:", reply_markup=get_teachers_keyboard()
+                "Пожалуйста, выберите преподавателя:",
+                reply_markup=get_teachers_keyboard(),
             )
             await state.set_state(ApplicationForm.teacher_name)
 
         else:
             await callback.message.answer(
-                "Выбери вариант с преподавателем:",
+                "Пожалуйста, выберите вариант с преподавателем:",
                 reply_markup=get_teacher_choice_keyboard(),
             )
             await state.set_state(ApplicationForm.teacher_choice)
 
     elif current_state == ApplicationForm.contact_value.state:
         await callback.message.answer(
-            "Выбери способ связи:",
+            "Пожалуйста, выберите способ связи:",
             reply_markup=get_contact_method_keyboard(),
         )
         await state.set_state(ApplicationForm.contact_method)
@@ -112,7 +121,7 @@ async def back_step(callback: CallbackQuery, state: FSMContext):
 @router.message(ApplicationForm.name)
 async def get_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text)
-    await message.answer("Выбери класс:", reply_markup=get_class_keyboard())
+    await message.answer("Пожалуйста, выберите класс:", reply_markup=get_class_keyboard())
     await state.set_state(ApplicationForm.school_class)
 
 
@@ -122,7 +131,8 @@ async def get_class(callback: CallbackQuery, state: FSMContext):
     await state.update_data(school_class=selected_class)
 
     await callback.message.answer(
-        "Выбери цель обучения:", reply_markup=get_goal_keyboard()
+        "Пожалуйста, выберите цель обучения:",
+        reply_markup=get_goal_keyboard(),
     )
     await state.set_state(ApplicationForm.goal)
     await callback.answer()
@@ -134,7 +144,8 @@ async def get_goal(callback: CallbackQuery, state: FSMContext):
     await state.update_data(goal=selected_goal)
 
     await callback.message.answer(
-        "Выбери тип занятия:", reply_markup=get_lesson_type_keyboard()
+        "Пожалуйста, выберите формат занятий:",
+        reply_markup=get_lesson_type_keyboard(),
     )
     await state.set_state(ApplicationForm.lesson_type)
     await callback.answer()
@@ -142,7 +153,10 @@ async def get_goal(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(ApplicationForm.lesson_type, lambda c: c.data.startswith("lesson_"))
 async def get_lesson_type(callback: CallbackQuery, state: FSMContext):
-    lesson_map = {"lesson_individual": "Индивидуально", "lesson_group": "Мини-группа"}
+    lesson_map = {
+        "lesson_individual": "Индивидуально",
+        "lesson_group": "Мини-группа",
+    }
 
     selected_lesson_type = lesson_map.get(callback.data, callback.data)
     await state.update_data(lesson_type=selected_lesson_type)
@@ -152,13 +166,14 @@ async def get_lesson_type(callback: CallbackQuery, state: FSMContext):
 
     if from_teacher_card:
         await callback.message.answer(
-            "Выбери способ связи:", reply_markup=get_contact_method_keyboard()
+            "Пожалуйста, выберите способ связи:",
+            reply_markup=get_contact_method_keyboard(),
         )
         await state.set_state(ApplicationForm.contact_method)
     else:
         await state.update_data(subjects=[])
         await callback.message.answer(
-            "Выбери один или несколько предметов, затем нажми «Готово»:",
+            "Пожалуйста, выберите один или несколько предметов, затем нажмите «Готово»:",
             reply_markup=get_subjects_keyboard([]),
         )
         await state.set_state(ApplicationForm.subjects)
@@ -192,11 +207,12 @@ async def finish_subjects(callback: CallbackQuery, state: FSMContext):
     subjects = data.get("subjects", [])
 
     if not subjects:
-        await callback.answer("Выбери хотя бы один предмет", show_alert=True)
+        await callback.answer("Пожалуйста, выберите хотя бы один предмет.", show_alert=True)
         return
 
     await callback.message.answer(
-        "Выбери вариант с преподавателем:", reply_markup=get_teacher_choice_keyboard()
+        "Пожалуйста, выберите вариант с преподавателем:",
+        reply_markup=get_teacher_choice_keyboard(),
     )
     await state.set_state(ApplicationForm.teacher_choice)
     await callback.answer()
@@ -209,16 +225,19 @@ async def finish_subjects(callback: CallbackQuery, state: FSMContext):
 async def choose_teacher_mode(callback: CallbackQuery, state: FSMContext):
     if callback.data == "teacher_pick":
         await state.update_data(
-            teacher_choice="Подобрать преподавателя", teacher_name="Не выбран"
+            teacher_choice="Подобрать преподавателя",
+            teacher_name="Не выбран",
         )
         await callback.message.answer(
-            "Выбери способ связи:", reply_markup=get_contact_method_keyboard()
+            "Пожалуйста, выберите способ связи:",
+            reply_markup=get_contact_method_keyboard(),
         )
         await state.set_state(ApplicationForm.contact_method)
     else:
         await state.update_data(teacher_choice="Выбрать конкретного")
         await callback.message.answer(
-            "Выбери преподавателя:", reply_markup=get_teachers_keyboard()
+            "Пожалуйста, выберите преподавателя:",
+            reply_markup=get_teachers_keyboard(),
         )
         await state.set_state(ApplicationForm.teacher_name)
 
@@ -231,7 +250,8 @@ async def choose_teacher_name(callback: CallbackQuery, state: FSMContext):
     await state.update_data(teacher_name=teacher_name)
 
     await callback.message.answer(
-        "Выбери способ связи:", reply_markup=get_contact_method_keyboard()
+        "Пожалуйста, выберите способ связи:",
+        reply_markup=get_contact_method_keyboard(),
     )
     await state.set_state(ApplicationForm.contact_method)
     await callback.answer()
@@ -244,7 +264,7 @@ async def choose_contact_method(callback: CallbackQuery, state: FSMContext):
     contact_method = callback.data.split("_", 1)[1]
     await state.update_data(contact_method=contact_method)
 
-    await callback.message.answer("Введи контакт для связи:")
+    await callback.message.answer("Пожалуйста, укажите контакт для связи:")
     await state.set_state(ApplicationForm.contact_value)
     await callback.answer()
 
@@ -258,21 +278,21 @@ async def get_contact_value(message: Message, state: FSMContext):
     if contact_method == "Telegram":
         if not is_valid_telegram_username(contact_value):
             await message.answer(
-                "Введи корректный Telegram username в формате @username"
+                "Пожалуйста, укажите корректный Telegram username в формате @username."
             )
             return
 
     elif contact_method in ["WhatsApp", "Звонок"]:
         if not is_valid_phone(contact_value):
             await message.answer(
-                "Введи корректный номер телефона. Пример: +79991234567"
+                "Пожалуйста, укажите корректный номер телефона. Пример: +79991234567."
             )
             return
 
     await state.update_data(contact_value=contact_value)
     await message.answer(
-        "Напиши комментарий. Если комментария нет, напиши: -\n"
-        "Чтобы вернуться назад, напиши: назад"
+        "Пожалуйста, напишите комментарий. Если комментария нет, укажите: -\n"
+        "Чтобы вернуться на предыдущий шаг, напишите: назад"
     )
     await state.set_state(ApplicationForm.comment)
 
@@ -280,7 +300,7 @@ async def get_contact_value(message: Message, state: FSMContext):
 @router.message(ApplicationForm.comment)
 async def get_comment(message: Message, state: FSMContext):
     if message.text.strip().lower() == "назад":
-        await message.answer("Введи контакт для связи:")
+        await message.answer("Пожалуйста, укажите контакт для связи:")
         await state.set_state(ApplicationForm.contact_value)
         return
 
@@ -290,5 +310,7 @@ async def get_comment(message: Message, state: FSMContext):
     text = build_application_text(data)
 
     await message.bot.send_message(APPLICATIONS_CHAT_ID, text, parse_mode="HTML")
-    await message.answer("Спасибо, заявка отправлена. Мы свяжемся с вами в ближайшее время.")
+    await message.answer(
+        "Благодарим, Ваша заявка отправлена. Мы свяжемся с Вами в ближайшее время."
+    )
     await show_main_menu(message, state)

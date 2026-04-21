@@ -56,3 +56,61 @@ def test_payment_finalize_is_idempotent(db):
     payment = db.get_payment_request_by_id(payment_request_id)
     assert payment is not None
     assert payment[7] == "approved"
+
+
+def test_recent_payment_history_for_student(db):
+    student_id = db.add_student(
+        full_name="Anna Petrova",
+        telegram_id=10003,
+        phone="+79990003344",
+    )
+    teacher_id = db.add_teacher_if_not_exists("Darya Petrova", telegram_id=20003)
+    db.add_student_lesson(
+        student_id=student_id,
+        teacher_id=teacher_id,
+        subject_name="Russian",
+        lesson_balance=3,
+        tariff_type="package",
+    )
+    direction_id = db.get_student_directions(student_id)[0][0]
+
+    approved_payment_id = db.create_payment_request(
+        telegram_user_id=10003,
+        telegram_username="@anna",
+        telegram_full_name="Anna Petrova",
+        caption_text="April payment",
+        file_id="approved-file-id",
+        file_type="photo",
+    )
+    db.try_transition_payment_request_status(
+        payment_request_id=approved_payment_id,
+        allowed_from_statuses=["pending"],
+        new_status="processing",
+        admin_id=90001,
+    )
+    db.finalize_payment_with_topup(
+        payment_request_id=approved_payment_id,
+        direction_id=direction_id,
+        lessons_count=4,
+        admin_id=90001,
+        comment=f"Начисление после подтверждения оплаты #{approved_payment_id}",
+    )
+
+    pending_payment_id = db.create_payment_request(
+        telegram_user_id=10003,
+        telegram_username="@anna",
+        telegram_full_name="Anna Petrova",
+        caption_text="May payment",
+        file_id="pending-file-id",
+        file_type="photo",
+    )
+
+    history = db.get_recent_payment_history_by_telegram_user(10003, limit=4)
+
+    assert len(history) == 2
+    assert history[0][0] == pending_payment_id
+    assert history[0][1] == "pending"
+    assert history[0][5] == 0
+    assert history[1][0] == approved_payment_id
+    assert history[1][1] == "approved"
+    assert history[1][5] == 4
