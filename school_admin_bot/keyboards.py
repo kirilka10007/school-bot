@@ -149,7 +149,8 @@ def get_attendance_direction_keyboard(directions):
 
 def get_teacher_attendance_students_keyboard(students):
     buttons = []
-    for student_id, full_name, _telegram_id, _phone in students:
+    for student in students:
+        student_id, full_name = student[0], student[1]
         buttons.append(
             [
                 InlineKeyboardButton(

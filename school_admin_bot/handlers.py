@@ -1684,16 +1684,17 @@ async def teacher_students(callback: CallbackQuery):
         return
 
     lines = ["<b>Ваши ученики:</b>\n"]
-    for student_id, full_name, telegram_id, phone in students:
+    for student_id, full_name, _telegram_id, phone, telegram_username in students:
         directions = get_teacher_owned_directions(callback.from_user.id, student_id)
         direction_text = "; ".join(
             f"{subject_name} (остаток: {lesson_balance})"
             for _, _, subject_name, lesson_balance, _ in directions
         ) or "Направления пока не найдены"
+        username_text = f"@{telegram_username}" if telegram_username else "не указан"
 
         lines.append(
             f"• <b>{full_name}</b>\n"
-            f"ID: <code>{telegram_id if telegram_id else '-'}</code>\n"
+            f"Username: <code>{username_text}</code>\n"
             f"Телефон: {phone if phone else '-'}\n"
             f"Направления: {direction_text}\n"
         )
@@ -1761,7 +1762,8 @@ async def teacher_attendance(callback: CallbackQuery):
         return
 
     directions = []
-    for student_id, _, _, _ in students:
+    for student in students:
+        student_id = student[0]
         directions.extend(get_teacher_owned_directions(callback.from_user.id, student_id))
 
     if not directions:

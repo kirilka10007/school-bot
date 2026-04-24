@@ -1335,7 +1335,8 @@ def get_students_by_teacher_telegram_id(telegram_id: int):
             s.id,
             s.full_name,
             s.telegram_id,
-            s.phone
+            s.phone,
+            s.telegram_username
         FROM student_lessons sl
         JOIN students s ON sl.student_id = s.id
         JOIN teachers t ON sl.teacher_id = t.id
