@@ -2142,6 +2142,51 @@ def _delete_teacher_entities_for_user(cur, telegram_id: int, full_name: str | No
         cur.execute("DELETE FROM teachers WHERE id = ?", (teacher_id,))
 
 
+def _delete_student_entities_for_user(cur, telegram_id: int, full_name: str | None):
+    student_ids: set[int] = set()
+
+    cur.execute(
+        """
+        SELECT id
+        FROM students
+        WHERE telegram_id = ?
+        """,
+        (telegram_id,),
+    )
+    student_ids.update(int(row[0]) for row in cur.fetchall() if row and row[0] is not None)
+
+    if full_name:
+        cur.execute(
+            """
+            SELECT id
+            FROM students
+            WHERE full_name = ?
+              AND (telegram_id IS NULL OR telegram_id = ?)
+            """,
+            (full_name, telegram_id),
+        )
+        student_ids.update(int(row[0]) for row in cur.fetchall() if row and row[0] is not None)
+
+    for student_id in student_ids:
+        cur.execute("SELECT id FROM student_lessons WHERE student_id = ?", (student_id,))
+        lesson_ids = [int(row[0]) for row in cur.fetchall() if row and row[0] is not None]
+
+        for lesson_id in lesson_ids:
+            cur.execute("DELETE FROM attendance WHERE student_lesson_id = ?", (lesson_id,))
+            cur.execute("DELETE FROM balance_history WHERE student_lesson_id = ?", (lesson_id,))
+
+        cur.execute("DELETE FROM student_lessons WHERE student_id = ?", (student_id,))
+        cur.execute("DELETE FROM students WHERE id = ?", (student_id,))
+
+    cur.execute(
+        """
+        DELETE FROM payment_requests
+        WHERE telegram_user_id = ?
+        """,
+        (telegram_id,),
+    )
+
+
 def update_user_role(telegram_id: int, role: str) -> bool:
     conn = get_connection()
     cur = conn.cursor()
@@ -2158,26 +2203,14 @@ def update_user_role(telegram_id: int, role: str) -> bool:
     previous_full_name = existing_user[0] if existing_user else None
     previous_role = existing_user[1] if existing_user else None
 
-    if role == "teacher":
-        cur.execute(
-            """
-            UPDATE students
-            SET telegram_id = NULL
-            WHERE telegram_id = ?
-            """,
-            (telegram_id,),
-        )
-    elif role == "student":
-        cur.execute(
-            """
-            UPDATE teachers
-            SET telegram_id = NULL
-            WHERE telegram_id = ?
-            """,
-            (telegram_id,),
-        )
-    elif previous_role == "teacher":
-        _delete_teacher_entities_for_user(cur, telegram_id, previous_full_name)
+    if previous_role != role:
+        if role == "teacher":
+            _delete_student_entities_for_user(cur, telegram_id, previous_full_name)
+        elif role == "student":
+            _delete_teacher_entities_for_user(cur, telegram_id, previous_full_name)
+        elif role == "admin":
+            _delete_teacher_entities_for_user(cur, telegram_id, previous_full_name)
+            _delete_student_entities_for_user(cur, telegram_id, previous_full_name)
 
     cur.execute(
         """

@@ -2409,8 +2409,13 @@ async def process_role_change_user_pick(callback: CallbackQuery, state: FSMConte
         await callback.answer("Пользователь не найден", show_alert=True)
         return
 
-    _, target_telegram_id, _target_full_name, _current_role, _is_active, _username = target_user
-    await state.update_data(role_change_target_id=target_telegram_id)
+    _, target_telegram_id, target_full_name, current_role, _is_active, target_username = target_user
+    await state.update_data(
+        role_change_target_id=target_telegram_id,
+        role_change_target_full_name=target_full_name,
+        role_change_target_current_role=current_role,
+        role_change_target_username=target_username,
+    )
     await callback.message.answer(
         "Выберите новую роль:",
         reply_markup=get_role_change_keyboard(),
@@ -2448,7 +2453,8 @@ async def process_role_change_selection(callback: CallbackQuery, state: FSMConte
         await callback.answer()
         return
 
-    _, _, target_full_name, current_role, _is_active = target_user
+    target_full_name = data.get("role_change_target_full_name") or target_user[2]
+    current_role = data.get("role_change_target_current_role") or target_user[3]
 
     if action == "disabled":
         changed = set_user_active(target_telegram_id, False)
@@ -2479,13 +2485,38 @@ async def process_role_change_selection(callback: CallbackQuery, state: FSMConte
         await callback.answer("Неизвестная роль", show_alert=True)
         return
 
+    if action == "teacher":
+        subjects = [item for item in get_teacher_catalog_subjects() if item]
+        await state.update_data(
+            role_change_target_id=target_telegram_id,
+            role_change_target_full_name=target_full_name,
+            role_change_target_current_role=current_role,
+            role_teacher_subject_options=subjects,
+        )
+        if subjects:
+            preview = ", ".join(subjects[:12])
+            await callback.message.answer(
+                "Настройка карточки преподавателя.\n\n"
+                f"ФИО: {target_full_name}\n"
+                f"Текущая роль: {current_role}\n\n"
+                "Введите предмет (можно новый) или выберите из существующих:\n"
+                f"{preview}"
+            )
+        else:
+            await callback.message.answer(
+                "Настройка карточки преподавателя.\n\n"
+                f"ФИО: {target_full_name}\n"
+                f"Текущая роль: {current_role}\n\n"
+                "Введите предмет (например: Математика)."
+            )
+        await state.set_state(AdminStates.waiting_role_teacher_subject)
+        await callback.answer()
+        return
+
     changed = update_user_role(target_telegram_id, action)
     if not changed:
         await callback.answer("Не удалось изменить роль", show_alert=True)
         return
-
-    if action == "teacher":
-        add_teacher_if_not_exists(full_name=target_full_name, telegram_id=target_telegram_id)
 
     log_admin_action(
         admin_telegram_id=callback.from_user.id,
@@ -2505,6 +2536,121 @@ async def process_role_change_selection(callback: CallbackQuery, state: FSMConte
         reply_markup=get_superadmin_menu(),
     )
     await callback.answer("Готово")
+
+
+@router.message(AdminStates.waiting_role_teacher_subject)
+async def process_role_teacher_subject(message: Message, state: FSMContext):
+    if message.from_user.id not in SUPERADMINS:
+        await message.answer("Нет доступа.")
+        await state.clear()
+        return
+
+    subject_name = (message.text or "").strip()
+    if len(subject_name) < 2:
+        await message.answer("Введите корректный предмет (минимум 2 символа).")
+        return
+
+    await state.update_data(role_teacher_subject=subject_name)
+    await message.answer(
+        "Введите описание преподавателя.\n"
+        "Если описание пока не нужно — отправьте символ: -"
+    )
+    await state.set_state(AdminStates.waiting_role_teacher_description)
+
+
+@router.message(AdminStates.waiting_role_teacher_description)
+async def process_role_teacher_description(message: Message, state: FSMContext):
+    if message.from_user.id not in SUPERADMINS:
+        await message.answer("Нет доступа.")
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    description = None if text == "-" else text
+    await state.update_data(role_teacher_description=description)
+    await message.answer(
+        "Отправьте фото преподавателя.\n"
+        "Если фото пока не нужно — отправьте символ: -"
+    )
+    await state.set_state(AdminStates.waiting_role_teacher_photo)
+
+
+@router.message(AdminStates.waiting_role_teacher_photo)
+async def process_role_teacher_photo(message: Message, state: FSMContext):
+    if message.from_user.id not in SUPERADMINS:
+        await message.answer("Нет доступа.")
+        await state.clear()
+        return
+
+    photo_path = None
+    if message.photo:
+        try:
+            photo_path = await save_teacher_photo(message)
+        except Exception as exc:
+            logger.exception("Failed to save role-change teacher photo locally: %s", exc)
+            await message.answer("Не удалось сохранить фото. Отправьте другое фото или '-' чтобы пропустить.")
+            return
+    else:
+        text = (message.text or "").strip()
+        if text != "-":
+            await message.answer("Отправьте фото или '-' чтобы пропустить.")
+            return
+
+    data = await state.get_data()
+    target_telegram_id = data.get("role_change_target_id")
+    target_full_name = data.get("role_change_target_full_name")
+    current_role = data.get("role_change_target_current_role")
+    subject_name = data.get("role_teacher_subject")
+    description = data.get("role_teacher_description")
+
+    if not target_telegram_id or not target_full_name or not subject_name:
+        await state.clear()
+        await message.answer("Не удалось завершить смену роли. Попробуйте заново.", reply_markup=get_superadmin_menu())
+        return
+
+    changed = update_user_role(int(target_telegram_id), "teacher")
+    if not changed:
+        await state.clear()
+        await message.answer("Не удалось изменить роль пользователя.", reply_markup=get_superadmin_menu())
+        return
+
+    teacher_id = add_or_update_teacher_profile(
+        full_name=target_full_name,
+        subject_name=subject_name,
+        telegram_id=int(target_telegram_id),
+        description=description,
+        photo_path=photo_path,
+    )
+
+    log_admin_action(
+        admin_telegram_id=message.from_user.id,
+        action_type="change_role",
+        target_type="user",
+        target_id=int(target_telegram_id),
+        details={
+            "before": {"role": current_role, "is_active": True},
+            "after": {
+                "role": "teacher",
+                "is_active": True,
+                "teacher_id": teacher_id,
+                "subject_name": subject_name,
+                "description": description,
+                "photo_path": photo_path,
+            },
+        },
+        status="success",
+    )
+
+    await state.clear()
+    await message.answer(
+        "Роль пользователя обновлена и карточка преподавателя создана.\n\n"
+        f"Telegram ID: {target_telegram_id}\n"
+        f"ФИО: {target_full_name}\n"
+        f"Предмет: {subject_name}\n"
+        f"Описание: {'добавлено' if description else 'не указано'}\n"
+        f"Фото: {'добавлено' if photo_path else 'не указано'}",
+        reply_markup=get_superadmin_menu(),
+    )
 
 
 @router.message(AdminStates.waiting_new_admin_username)
