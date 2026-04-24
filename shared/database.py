@@ -2802,10 +2802,10 @@ def create_publication_post(
     return post_id
 
 
-def get_due_publication_posts(limit: int = 20):
+def get_due_publication_posts(limit: int = 20, now_ts: str | None = None):
     conn = get_connection()
     cur = conn.cursor()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = (now_ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")).strip()
     cur.execute(
         """
         SELECT

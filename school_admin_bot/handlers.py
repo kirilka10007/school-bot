@@ -5,9 +5,10 @@ from aiogram.fsm.context import FSMContext
 import logging
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from config import SCHOOL_BOT_TOKEN, SCHOOL_BOT_USERNAME, SUPERADMINS
 from keyboards import (
@@ -90,6 +91,14 @@ router.callback_query.filter(F.message.chat.type == "private")
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TEACHER_UPLOADS_DIR = PROJECT_ROOT / "school-bot" / "assets" / "teachers_uploaded"
+try:
+    MSK_TZ = ZoneInfo("Europe/Moscow")
+except Exception:
+    MSK_TZ = timezone(timedelta(hours=3))
+
+
+def msk_now_naive() -> datetime:
+    return datetime.now(MSK_TZ).replace(tzinfo=None)
 
 
 async def update_flow_message(
@@ -824,7 +833,7 @@ async def admin_publication_schedule_mode(callback: CallbackQuery, state: FSMCon
         return
 
     if callback.data == "publication_send_now":
-        scheduled_for = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        scheduled_for = msk_now_naive().strftime("%Y-%m-%d %H:%M:%S")
         post_id = create_publication_post(
             created_by=callback.from_user.id,
             audience=audience,
@@ -848,7 +857,7 @@ async def admin_publication_schedule_mode(callback: CallbackQuery, state: FSMCon
         )
         await state.clear()
         await callback.message.answer(
-            f"Публикация создана и поставлена в очередь отправки (ID: {post_id}).",
+            f"Публикация создана и поставлена в очередь отправки (ID: {post_id}, время МСК).",
             reply_markup=get_admin_reply_menu(callback.from_user.id),
         )
         await callback.answer("Готово")
@@ -856,6 +865,7 @@ async def admin_publication_schedule_mode(callback: CallbackQuery, state: FSMCon
 
     await callback.message.answer(
         "Введите дату и время публикации.\n"
+        "Время указывайте по МСК.\n"
         "Формат: ДД.ММ.ГГГГ ЧЧ:ММ\n"
         "Например: 25.04.2026 10:30"
     )
@@ -872,10 +882,10 @@ async def admin_publication_schedule_datetime(message: Message, state: FSMContex
 
     schedule_dt = parse_publication_schedule(message.text or "")
     if schedule_dt is None:
-        await message.answer("Неверный формат даты. Пример: 25.04.2026 10:30")
+        await message.answer("Неверный формат даты. Укажите время по МСК. Пример: 25.04.2026 10:30")
         return
-    if schedule_dt <= datetime.now():
-        await message.answer("Дата должна быть в будущем. Укажите более позднее время.")
+    if schedule_dt <= msk_now_naive():
+        await message.answer("Дата должна быть в будущем (по МСК). Укажите более позднее время.")
         return
 
     data = await state.get_data()
@@ -915,7 +925,7 @@ async def admin_publication_schedule_datetime(message: Message, state: FSMContex
 
     await state.clear()
     await message.answer(
-        f"Публикация запланирована на {schedule_dt.strftime('%d.%m.%Y %H:%M')} (ID: {post_id}).",
+        f"Публикация запланирована на {schedule_dt.strftime('%d.%m.%Y %H:%M')} МСК (ID: {post_id}).",
         reply_markup=get_admin_reply_menu(message.from_user.id),
     )
 

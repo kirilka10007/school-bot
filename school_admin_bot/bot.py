@@ -4,7 +4,8 @@ import json
 import logging
 import os
 from io import BytesIO
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import BufferedInputFile
@@ -35,6 +36,14 @@ from shared.logging_setup import get_log_settings, setup_logging
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+try:
+    MSK_TZ = ZoneInfo("Europe/Moscow")
+except Exception:
+    MSK_TZ = timezone(timedelta(hours=3))
+
+
+def msk_now_naive() -> datetime:
+    return datetime.now(MSK_TZ).replace(tzinfo=None)
 
 
 def _format_debt_report_text(report_data: dict, overdue_days: int) -> str:
@@ -149,7 +158,10 @@ async def publication_worker():
     try:
         while True:
             try:
-                due_posts = get_due_publication_posts(limit=20)
+                due_posts = get_due_publication_posts(
+                    limit=20,
+                    now_ts=msk_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
+                )
 
                 for post in due_posts:
                     (
