@@ -1729,8 +1729,6 @@ def finalize_payment_with_topup(
     cur = conn.cursor()
 
     try:
-        cur.execute("BEGIN IMMEDIATE")
-
         cur.execute(
             """
             SELECT status

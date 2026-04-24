@@ -25,6 +25,7 @@ from states import ApplicationForm
 from .common import build_payment_caption, show_main_menu
 
 router = Router()
+PENDING_MANUAL_TOPUPS: dict[int, tuple[int, int]] = {}
 
 
 def _is_private_chat(message: Message) -> bool:
@@ -427,20 +428,24 @@ async def manual_payment_topup_start(callback: CallbackQuery, state: FSMContext)
         return
 
     _, _, _, subject_name, lesson_balance, _, student_name, teacher_name = lesson
-    await state.update_data(
-        manual_payment_request_id=payment_request_id,
-        manual_direction_id=direction_id,
-    )
+    await state.clear()
+    PENDING_MANUAL_TOPUPS[callback.from_user.id] = (payment_request_id, direction_id)
 
-    await callback.message.answer(
+    prompt_text = (
         f"Ученик: {student_name}\n"
         f"Предмет: {subject_name}\n"
         f"Преподаватель: {teacher_name}\n"
         f"Текущий баланс: {lesson_balance}\n\n"
-        "Введите вручную, сколько занятий начислить:"
+        "Введите вручную, сколько занятий начислить (только число):"
     )
-    await state.set_state(ApplicationForm.payment_manual_amount)
-    await callback.answer()
+    try:
+        await callback.bot.send_message(callback.from_user.id, prompt_text)
+        await callback.answer("Отправил запрос в личный чат с ботом", show_alert=True)
+    except Exception:
+        await callback.answer(
+            "Не удалось написать в личку. Откройте бота в личке и нажмите /start, затем повторите.",
+            show_alert=True,
+        )
 
 
 @router.callback_query(lambda c: c.data.startswith("payadd_"))
@@ -557,9 +562,13 @@ async def add_lessons_after_payment(callback: CallbackQuery):
     await callback.answer("Занятия начислены")
 
 
+@router.message(lambda m: _is_private_chat(m) and _is_payment_moderator(m.from_user.id) and m.from_user.id in PENDING_MANUAL_TOPUPS)
 @router.message(ApplicationForm.payment_manual_amount)
 async def process_manual_payment_amount(message: Message, state: FSMContext):
-    if not _is_payments_chat(message) or not _is_payment_moderator(message.from_user.id):
+    if not _is_payment_moderator(message.from_user.id):
+        return
+
+    if not message.text:
         return
 
     text = message.text.strip()
@@ -576,7 +585,12 @@ async def process_manual_payment_amount(message: Message, state: FSMContext):
     payment_request_id = data.get("manual_payment_request_id")
     direction_id = data.get("manual_direction_id")
     if not payment_request_id or not direction_id:
-        await message.answer("Не удалось получить данные для начисления.")
+        pending = PENDING_MANUAL_TOPUPS.get(message.from_user.id)
+        if pending:
+            payment_request_id, direction_id = pending
+
+    if not payment_request_id or not direction_id:
+        await message.answer("Нет активного ручного начисления. Нажмите «Указать вручную» у нужной оплаты.")
         await state.clear()
         return
 
@@ -630,6 +644,7 @@ async def process_manual_payment_amount(message: Message, state: FSMContext):
         await message.answer(
             f"Не удалось завершить начисление: оплата уже обработана (статус: {latest_status})."
         )
+        PENDING_MANUAL_TOPUPS.pop(message.from_user.id, None)
         await state.clear()
         return
 
@@ -667,4 +682,5 @@ async def process_manual_payment_amount(message: Message, state: FSMContext):
         except Exception:
             pass
 
+    PENDING_MANUAL_TOPUPS.pop(message.from_user.id, None)
     await state.clear()
