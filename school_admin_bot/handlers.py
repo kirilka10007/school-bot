@@ -29,6 +29,8 @@ from keyboards import (
     get_main_menu_shortcut_keyboard,
     get_user_selection_keyboard,
     get_teacher_selection_keyboard,
+    get_subject_selection_keyboard,
+    get_assign_subject_rename_keyboard,
     get_teacher_subject_picker_keyboard,
     get_publication_audience_keyboard,
     get_publication_schedule_keyboard,
@@ -1325,10 +1327,119 @@ async def choose_teacher_for_lesson(callback: CallbackQuery, state: FSMContext):
 
     _, _teacher_telegram_id, teacher_name, _teacher_subject, _description, _photo, _username = teacher
     await state.update_data(teacher_id=teacher_id, teacher_name=teacher_name)
-    await callback.message.answer(
-        f"Выбран преподаватель: {teacher_name}\n\nВведите часть названия предмета (или новое название):"
+    subjects = [item for item in get_teacher_catalog_subjects() if item]
+    await state.update_data(
+        assign_subject_options=subjects,
+        assign_subject_waiting_new=False,
+        assign_subject_waiting_alias=False,
+        assign_subject_base=None,
     )
+    if subjects:
+        await callback.message.answer(
+            f"Выбран преподаватель: {teacher_name}\n\n"
+            "Выберите предмет кнопкой из списка ниже\n"
+            "или введите часть названия для фильтрации.",
+            reply_markup=get_subject_selection_keyboard(subjects),
+        )
+    else:
+        await callback.message.answer(
+            f"Выбран преподаватель: {teacher_name}\n\n"
+            "Справочник предметов пока пуст.\n"
+            "Введите новый предмет текстом:"
+        )
+        await state.update_data(assign_subject_waiting_new=True)
     await state.set_state(AdminStates.waiting_subject_name)
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminStates.waiting_subject_name,
+    lambda c: c.data.startswith("assign_subject_pick_") or c.data == "assign_subject_add_new",
+)
+async def process_assign_subject_pick(callback: CallbackQuery, state: FSMContext):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    subject_options = data.get("assign_subject_options") or []
+
+    if callback.data == "assign_subject_add_new":
+        await state.update_data(
+            assign_subject_waiting_new=True,
+            assign_subject_waiting_alias=False,
+            assign_subject_base=None,
+        )
+        await callback.message.answer("Введите новый предмет текстом:")
+        await callback.answer()
+        return
+
+    try:
+        subject_index = int(callback.data.split("_")[-1])
+    except (TypeError, ValueError):
+        await callback.answer("Не удалось определить предмет", show_alert=True)
+        return
+
+    if subject_index < 0 or subject_index >= len(subject_options):
+        await callback.answer("Предмет не найден в текущем списке", show_alert=True)
+        return
+
+    selected_subject = (subject_options[subject_index] or "").strip()
+    if not selected_subject:
+        await callback.answer("Некорректный предмет", show_alert=True)
+        return
+
+    await state.update_data(
+        assign_subject_base=selected_subject,
+        assign_subject_waiting_new=False,
+        assign_subject_waiting_alias=False,
+    )
+    await callback.message.answer(
+        f"Выбран предмет: {selected_subject}\n\n"
+        "Нужно переименовать его только для этого ученика?",
+        reply_markup=get_assign_subject_rename_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminStates.waiting_subject_name,
+    lambda c: c.data in {"assign_subject_keep", "assign_subject_rename"},
+)
+async def process_assign_subject_rename_choice(callback: CallbackQuery, state: FSMContext):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    base_subject = (data.get("assign_subject_base") or "").strip()
+    if not base_subject:
+        await callback.answer("Сначала выберите предмет", show_alert=True)
+        return
+
+    if callback.data == "assign_subject_keep":
+        await state.update_data(
+            subject_name=base_subject,
+            expect_custom_subject=False,
+            assign_subject_waiting_alias=False,
+            assign_subject_waiting_new=False,
+        )
+        await callback.message.answer("Выбери тип тарифа:", reply_markup=get_tariff_keyboard())
+        await state.set_state(AdminStates.waiting_tariff_type)
+        await callback.answer()
+        return
+
+    await state.update_data(
+        assign_subject_waiting_alias=True,
+        assign_subject_waiting_new=False,
+    )
+    await callback.message.answer(
+        f"Введите новое отображаемое название для ученика.\n"
+        f"Базовый предмет останется: {base_subject}\n\n"
+        "Пример: ИЗО (на холсте)"
+    )
     await callback.answer()
 
 
@@ -1339,30 +1450,52 @@ async def get_subject_name(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    raw_subject_query = (message.text or "").strip()
-    if len(raw_subject_query) < 2:
-        await message.answer("Введите корректное название предмета (минимум 2 символа).")
+    raw_text = (message.text or "").strip()
+    if len(raw_text) < 2:
+        await message.answer("Введите минимум 2 символа.")
         return
 
-    subject_query = raw_subject_query.lower()
+    data = await state.get_data()
+    waiting_new = bool(data.get("assign_subject_waiting_new"))
+    waiting_alias = bool(data.get("assign_subject_waiting_alias"))
+
+    if waiting_alias:
+        await state.update_data(
+            subject_name=raw_text,
+            expect_custom_subject=True,
+            assign_subject_waiting_alias=False,
+        )
+        await message.answer("Выбери тип тарифа:", reply_markup=get_tariff_keyboard())
+        await state.set_state(AdminStates.waiting_tariff_type)
+        return
+
+    if waiting_new:
+        await state.update_data(
+            subject_name=raw_text,
+            expect_custom_subject=True,
+            assign_subject_waiting_new=False,
+        )
+        await message.answer("Выбери тип тарифа:", reply_markup=get_tariff_keyboard())
+        await state.set_state(AdminStates.waiting_tariff_type)
+        return
+
+    subject_query = raw_text.lower()
     subjects = [item for item in get_teacher_catalog_subjects() if item]
     matched_subjects = [item for item in subjects if subject_query in item.lower()]
+    await state.update_data(assign_subject_options=matched_subjects)
 
-    if len(matched_subjects) == 1:
-        subject_name = matched_subjects[0]
-    elif len(matched_subjects) > 1:
-        variants = ", ".join(matched_subjects[:6])
+    if matched_subjects:
         await message.answer(
-            "Найдено несколько предметов по запросу. Уточните название:\n"
-            f"{variants}"
+            "Найдены предметы. Выберите кнопкой или добавьте новый:",
+            reply_markup=get_subject_selection_keyboard(matched_subjects),
         )
         return
-    else:
-        subject_name = raw_subject_query
 
-    await state.update_data(subject_name=subject_name, expect_custom_subject=False)
-    await message.answer("Выбери тип тарифа:", reply_markup=get_tariff_keyboard())
-    await state.set_state(AdminStates.waiting_tariff_type)
+    await message.answer(
+        "По запросу предметы не найдены.\n"
+        "Введите другой запрос или нажмите «Добавить новый предмет».",
+        reply_markup=get_subject_selection_keyboard([]),
+    )
 
 
 @router.callback_query(AdminStates.waiting_tariff_type, lambda c: c.data in ["tariff_single", "tariff_package"])

@@ -25,7 +25,7 @@ def _load_env() -> None:
 
 _load_env()
 
-from shared.database import get_connection
+from shared.database import cleanup_orphan_teacher_subjects, get_connection
 
 
 def _connect():
@@ -141,6 +141,10 @@ def main() -> int:
     delete_parser.add_argument("--id", type=int, default=None)
     delete_parser.add_argument("--name", type=str, default=None)
 
+    subjects_parser = subparsers.add_parser("subjects", help="Subject operations")
+    subjects_sub = subjects_parser.add_subparsers(dest="action", required=True)
+    subjects_sub.add_parser("cleanup-orphans", help="Delete subjects not linked to current teacher subject")
+
     publication_parser = subparsers.add_parser("publications", help="Publication operations")
     publication_sub = publication_parser.add_subparsers(dest="action", required=True)
 
@@ -160,6 +164,15 @@ def main() -> int:
             print("Provide --id or --name")
             return 1
         return delete_teacher(args.id, args.name)
+
+    if args.entity == "subjects" and args.action == "cleanup-orphans":
+        result = cleanup_orphan_teacher_subjects()
+        print("Subjects cleanup completed:")
+        print(f"- before_total: {result['before_total']}")
+        print(f"- deleted_invalid: {result['deleted_invalid']}")
+        print(f"- deleted_not_linked: {result['deleted_not_linked']}")
+        print(f"- after_total: {result['after_total']}")
+        return 0
 
     if args.entity == "publications" and args.action == "list":
         conn = _connect()

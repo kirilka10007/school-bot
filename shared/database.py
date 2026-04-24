@@ -3052,6 +3052,53 @@ def get_teacher_catalog_subjects() -> list[str]:
     return [row[0] for row in rows]
 
 
+def cleanup_orphan_teacher_subjects() -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(1) FROM teacher_subjects")
+    before_total = int(cur.fetchone()[0] or 0)
+
+    cur.execute(
+        """
+        DELETE FROM teacher_subjects
+        WHERE subject_name IS NULL
+           OR TRIM(subject_name) = ''
+           OR teacher_id NOT IN (SELECT id FROM teachers)
+        """
+    )
+    deleted_invalid = int(cur.rowcount or 0)
+
+    cur.execute(
+        """
+        DELETE FROM teacher_subjects
+        WHERE EXISTS (
+            SELECT 1
+            FROM teachers t
+            WHERE t.id = teacher_subjects.teacher_id
+              AND (
+                  t.subject_name IS NULL
+                  OR TRIM(t.subject_name) = ''
+                  OR TRIM(t.subject_name) <> TRIM(teacher_subjects.subject_name)
+              )
+        )
+        """
+    )
+    deleted_not_linked = int(cur.rowcount or 0)
+
+    cur.execute("SELECT COUNT(1) FROM teacher_subjects")
+    after_total = int(cur.fetchone()[0] or 0)
+
+    conn.commit()
+    conn.close()
+    return {
+        "before_total": before_total,
+        "after_total": after_total,
+        "deleted_invalid": deleted_invalid,
+        "deleted_not_linked": deleted_not_linked,
+    }
+
+
 def get_teacher_catalog_names() -> list[str]:
     conn = get_connection()
     cur = conn.cursor()

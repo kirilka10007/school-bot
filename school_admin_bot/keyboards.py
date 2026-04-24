@@ -95,9 +95,19 @@ def get_subject_selection_keyboard(subjects: list[str]):
         buttons.append(
             [InlineKeyboardButton(text=subject[:64], callback_data=f"assign_subject_pick_{index}")]
         )
-    buttons.append([InlineKeyboardButton(text="Добавить новый предмет", callback_data="assign_subject_add_new")])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить новый предмет", callback_data="assign_subject_add_new")])
     buttons.append([InlineKeyboardButton(text="Главное меню", callback_data="menu_home")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_assign_subject_rename_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Оставить как есть", callback_data="assign_subject_keep")],
+            [InlineKeyboardButton(text="Переименовать для ученика", callback_data="assign_subject_rename")],
+            [InlineKeyboardButton(text="Главное меню", callback_data="menu_home")],
+        ]
+    )
 
 
 def get_teacher_subject_picker_keyboard(subjects: list[str]):
