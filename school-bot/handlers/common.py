@@ -4,13 +4,14 @@ from pathlib import Path
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, FSInputFile, InputMediaPhoto, Message
 
-from data import TEACHERS_DATA, load_reviews_from_folder
+from data import load_reviews_from_folder
 from keyboards import (
     get_main_menu_keyboard,
     get_review_card_keyboard,
     get_teacher_card_keyboard,
 )
 from states import ApplicationForm
+from shared.database import get_active_admin_contacts, get_teacher_cards_by_subject
 
 BOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -34,6 +35,34 @@ def resolve_local_path(path_value: str) -> str:
     if path.is_absolute():
         return str(path)
     return str((BOT_DIR / path).resolve())
+
+
+def get_teacher_cards_for_subject(subject: str) -> list[dict]:
+    normalized: list[dict] = []
+
+    for card in get_teacher_cards_by_subject(subject):
+        teacher_name = (card.get("name") or "").strip()
+        if not teacher_name:
+            continue
+        normalized.append(
+            {
+                "name": teacher_name,
+                "description": card.get("description") or "Описание преподавателя будет добавлено позже.",
+                "photo": card.get("photo"),
+                "telegram_id": card.get("telegram_id"),
+            }
+        )
+
+    return normalized
+
+
+def _get_photo_media(photo_ref: str | None):
+    if not photo_ref:
+        return None
+    resolved = Path(resolve_local_path(photo_ref))
+    if resolved.exists():
+        return FSInputFile(str(resolved))
+    return photo_ref
 
 
 def format_tariff_type(tariff_type: str) -> str:
@@ -114,8 +143,25 @@ def build_cabinet_text(
             f"   Остаток: <b>{lesson_balance}</b> | Тариф: {format_tariff_type(tariff_type)}"
         )
 
+    admin_text = build_admin_contacts_text()
+
     lines.extend(["", build_recent_payments_text(recent_payments)])
+    if admin_text:
+        lines.extend(["", admin_text])
     lines.extend(["", "Если информация отображается некорректно, пожалуйста, обратитесь к администратору."])
+    return "\n".join(lines)
+
+
+def build_admin_contacts_text() -> str:
+    admin_contacts = get_active_admin_contacts()
+    if not admin_contacts:
+        return ""
+    lines = ["<b>Напишите администратору:</b>"]
+    for telegram_id, full_name, username in admin_contacts:
+        if username:
+            lines.append(f"• <a href=\"https://t.me/{username}\">{full_name}</a>")
+        else:
+            lines.append(f"• <a href=\"tg://user?id={telegram_id}\">{full_name}</a>")
     return "\n".join(lines)
 
 
@@ -168,7 +214,7 @@ async def show_main_menu(message_obj: Message, state: FSMContext):
 async def send_teacher_card(
     message_obj: Message, subject: str, index: int, state: FSMContext
 ):
-    teachers = TEACHERS_DATA[subject]
+    teachers = get_teacher_cards_for_subject(subject)
     teacher = teachers[index]
 
     text = (
@@ -182,20 +228,32 @@ async def send_teacher_card(
         selected_teacher_index=index,
     )
 
-    photo_path = resolve_local_path(teacher.get("photo"))
-    photo = FSInputFile(photo_path)
+    photo = _get_photo_media(teacher.get("photo"))
+    if photo is None:
+        await message_obj.answer(
+            text,
+            reply_markup=get_teacher_card_keyboard(index, len(teachers)),
+        )
+        return
 
-    await message_obj.answer_photo(
-        photo=photo,
-        caption=text,
-        reply_markup=get_teacher_card_keyboard(index, len(teachers)),
-    )
+    try:
+        await message_obj.answer_photo(
+            photo=photo,
+            caption=text,
+            reply_markup=get_teacher_card_keyboard(index, len(teachers)),
+        )
+    except Exception:
+        # Fallback when Telegram cannot serve stored file_id/path.
+        await message_obj.answer(
+            text,
+            reply_markup=get_teacher_card_keyboard(index, len(teachers)),
+        )
 
 
 async def edit_teacher_card(
     callback: CallbackQuery, subject: str, index: int, state: FSMContext
 ):
-    teachers = TEACHERS_DATA[subject]
+    teachers = get_teacher_cards_for_subject(subject)
     teacher = teachers[index]
 
     text = (
@@ -209,13 +267,24 @@ async def edit_teacher_card(
         selected_teacher_index=index,
     )
 
-    photo_path = resolve_local_path(teacher.get("photo"))
-    photo = FSInputFile(photo_path)
+    photo = _get_photo_media(teacher.get("photo"))
+    if photo is None:
+        await callback.message.edit_text(
+            text,
+            reply_markup=get_teacher_card_keyboard(index, len(teachers)),
+        )
+        return
 
-    await callback.message.edit_media(
-        media=InputMediaPhoto(media=photo, caption=text),
-        reply_markup=get_teacher_card_keyboard(index, len(teachers)),
-    )
+    try:
+        await callback.message.edit_media(
+            media=InputMediaPhoto(media=photo, caption=text),
+            reply_markup=get_teacher_card_keyboard(index, len(teachers)),
+        )
+    except Exception:
+        await callback.message.edit_text(
+            text,
+            reply_markup=get_teacher_card_keyboard(index, len(teachers)),
+        )
 
 
 async def send_review_card(message_obj: Message, index: int, state: FSMContext):

@@ -1,43 +1,148 @@
-from aiogram import Router
-from aiogram.filters import CommandStart
+from aiogram import F, Router
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from data import TEACHERS_DATA, load_reviews_from_folder
+from data import load_reviews_from_folder
 from keyboards import (
     get_main_menu_keyboard,
     get_teacher_subject_keyboard,
     get_user_type_keyboard,
 )
+from shared.database import get_teacher_catalog_subjects
 from shared.database import (
+    add_user,
+    bind_student_telegram_by_id,
+    bind_teacher_telegram_by_id,
     find_students_by_telegram_id,
+    get_latest_student_by_username,
+    get_onboarding_invite_by_token,
     get_recent_payment_history_by_telegram_user,
     get_student_directions,
+    mark_onboarding_invite_used,
+    normalize_telegram_username,
+    upsert_known_telegram_user,
 )
 from states import ApplicationForm
 
 from .common import (
+    build_admin_contacts_text,
     build_cabinet_text,
     build_multi_students_warning,
     build_recent_payments_text,
     edit_review_card,
     edit_teacher_card,
+    get_teacher_cards_for_subject,
     send_review_card,
     send_teacher_card,
     show_main_menu,
 )
 
 router = Router()
+router.message.filter(F.chat.type == "private")
+router.callback_query.filter(F.message.chat.type == "private")
 
 
 @router.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     await state.clear()
+    username = normalize_telegram_username(message.from_user.username)
+    upsert_known_telegram_user(
+        telegram_id=message.from_user.id,
+        telegram_username=username,
+        full_name=message.from_user.full_name,
+    )
+
+    if username:
+        student_by_username = get_latest_student_by_username(username)
+        if student_by_username:
+            student_id, student_name, student_telegram_id, _phone = student_by_username
+            if not student_telegram_id:
+                bind_student_telegram_by_id(
+                    student_id=student_id,
+                    telegram_id=message.from_user.id,
+                    telegram_username=username,
+                )
+                add_user(
+                    telegram_id=message.from_user.id,
+                    full_name=student_name,
+                    role="student",
+                    telegram_username=username,
+                )
+
+    start_parts = (message.text or "").split(maxsplit=1)
+    start_payload = start_parts[1].strip() if len(start_parts) > 1 else ""
+
+    if start_payload.lower().startswith("invite_"):
+        token = start_payload[len("invite_"):].strip()
+        invite = get_onboarding_invite_by_token(token)
+        if not invite:
+            await message.answer("Ссылка приглашения недействительна или уже устарела.")
+            return
+
+        (
+            invite_id,
+            _token,
+            invite_role,
+            invite_full_name,
+            invite_username,
+            entity_type,
+            entity_id,
+            used_by_telegram_id,
+        ) = invite
+
+        if used_by_telegram_id:
+            await message.answer("Эта ссылка уже была использована.")
+            return
+
+        if not username or username != invite_username:
+            await message.answer(
+                "Эта ссылка привязана к другому @username. "
+                "Пожалуйста, войдите в Telegram с нужным аккаунтом и повторите."
+            )
+            return
+
+        add_user(
+            telegram_id=message.from_user.id,
+            full_name=invite_full_name or message.from_user.full_name,
+            role=invite_role,
+            telegram_username=username,
+        )
+
+        if invite_role == "student" and entity_type == "student" and entity_id:
+            bind_student_telegram_by_id(
+                student_id=int(entity_id),
+                telegram_id=message.from_user.id,
+                telegram_username=username,
+            )
+        if invite_role == "teacher" and entity_type == "teacher" and entity_id:
+            bind_teacher_telegram_by_id(
+                teacher_id=int(entity_id),
+                telegram_id=message.from_user.id,
+            )
+
+        mark_onboarding_invite_used(invite_id=int(invite_id), telegram_id=message.from_user.id)
+        await message.answer("Профиль успешно привязан. Доступ обновлен, используйте /start еще раз.")
+        return
+
+    if start_payload.lower() == "pay":
+        await message.answer(
+            "Здравствуйте!\n\n"
+            "Пожалуйста, отправьте фото или скриншот чека об оплате.\n\n"
+            "После проверки оплаты мы сообщим результат."
+        )
+        await state.set_state(ApplicationForm.payment_proof)
+        return
     await message.answer(
         "Здравствуйте! Пожалуйста, укажите, кто будет оставлять заявку.",
         reply_markup=get_user_type_keyboard(),
     )
     await state.set_state(ApplicationForm.user_type)
+
+
+@router.message(Command("menu"))
+async def menu_command_handler(message: Message, state: FSMContext):
+    await show_main_menu(message, state)
 
 
 @router.callback_query(
@@ -62,11 +167,23 @@ async def back_to_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@router.callback_query(lambda c: c.data == "no_teachers_available")
+async def no_teachers_available(callback: CallbackQuery):
+    await callback.answer("Преподаватели пока не добавлены.", show_alert=True)
+
+
 @router.callback_query(ApplicationForm.menu, lambda c: c.data == "menu_teachers")
 async def menu_teachers(callback: CallbackQuery, state: FSMContext):
+    subjects = get_teacher_catalog_subjects()
+    if not subjects:
+        await callback.message.answer(
+            "Список преподавателей пока пуст. Пожалуйста, обратитесь к администратору."
+        )
+        await callback.answer()
+        return
     await callback.message.answer(
         "Пожалуйста, выберите предмет:",
-        reply_markup=get_teacher_subject_keyboard(),
+        reply_markup=get_teacher_subject_keyboard(subjects),
     )
     await state.set_state(ApplicationForm.teacher_subject)
     await callback.answer()
@@ -107,11 +224,13 @@ async def menu_cabinet(callback: CallbackQuery, state: FSMContext):
 
     if not directions:
         warning = build_multi_students_warning(len(students))
+        admin_contacts_text = build_admin_contacts_text()
         await callback.message.answer(
             f"👤 <b>Личный кабинет</b>\n\n"
             f"<b>Ученик:</b> {student_name}\n"
             f"Активные направления пока отсутствуют.\n\n"
-            f"{build_recent_payments_text(recent_payments)}{warning}",
+            f"{build_recent_payments_text(recent_payments)}\n\n"
+            f"{admin_contacts_text if admin_contacts_text else ''}{warning}",
             parse_mode="HTML",
         )
         await callback.answer()
@@ -145,7 +264,7 @@ async def navigate_reviews(callback: CallbackQuery, state: FSMContext):
 )
 async def choose_teacher_subject(callback: CallbackQuery, state: FSMContext):
     subject = callback.data.split("teacher_subject_", 1)[1]
-    teachers = TEACHERS_DATA.get(subject, [])
+    teachers = get_teacher_cards_for_subject(subject)
     if not teachers:
         await callback.answer(
             "По этому предмету преподаватели пока не добавлены.",
@@ -165,13 +284,21 @@ async def navigate_teacher_cards(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     subject = data["selected_teacher_subject"]
     index = data["selected_teacher_index"]
+    teachers = get_teacher_cards_for_subject(subject)
 
     if callback.data == "teacher_prev" and index > 0:
         index -= 1
-    elif callback.data == "teacher_next" and index < len(TEACHERS_DATA[subject]) - 1:
+    elif callback.data == "teacher_next" and index < len(teachers) - 1:
         index += 1
 
-    await edit_teacher_card(callback, subject, index, state)
+    try:
+        await edit_teacher_card(callback, subject, index, state)
+    except Exception:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await send_teacher_card(callback.message, subject, index, state)
     await callback.answer()
 
 
@@ -180,7 +307,11 @@ async def signup_from_teacher_card(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     subject = data["selected_teacher_subject"]
     index = data["selected_teacher_index"]
-    teacher = TEACHERS_DATA[subject][index]
+    teachers = get_teacher_cards_for_subject(subject)
+    if index < 0 or index >= len(teachers):
+        await callback.answer("Карточка преподавателя не найдена.", show_alert=True)
+        return
+    teacher = teachers[index]
     user_type = data.get("user_type")
 
     await state.clear()

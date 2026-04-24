@@ -5,7 +5,8 @@ set ROOT=%~dp0
 set PYTHON=
 set PYTHONPATH=%ROOT%.python_packages;%ROOT%
 
-if exist "%ROOT%school-bot\venv\Scripts\python.exe" set PYTHON=%ROOT%school-bot\venv\Scripts\python.exe
+if exist "%ROOT%school_admin_bot\venv\Scripts\python.exe" set PYTHON=%ROOT%school_admin_bot\venv\Scripts\python.exe
+if not defined PYTHON if exist "%ROOT%school-bot\venv\Scripts\python.exe" set PYTHON=%ROOT%school-bot\venv\Scripts\python.exe
 if defined PYTHON goto :python_found
 
 for /f "tokens=2,*" %%A in ('reg query "HKCU\Software\Python\PythonCore\3.13\InstallPath" /v ExecutablePath 2^>nul ^| find "ExecutablePath"') do set PYTHON=%%B
@@ -24,4 +25,4 @@ if not defined PYTHON (
 )
 
 cd /d "%ROOT%"
-"%PYTHON%" school-bot\bot.py
+"%PYTHON%" scripts\db_admin.py %*

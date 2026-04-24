@@ -1,9 +1,10 @@
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from config import APPLICATIONS_CHAT_ID
 from keyboards import (
+    get_all_teacher_names,
     get_class_keyboard,
     get_contact_method_keyboard,
     get_goal_keyboard,
@@ -22,6 +23,8 @@ from .common import (
 )
 
 router = Router()
+router.message.filter(F.chat.type == "private")
+router.callback_query.filter(F.message.chat.type == "private")
 
 
 @router.callback_query(ApplicationForm.menu, lambda c: c.data == "menu_signup")
@@ -282,7 +285,7 @@ async def get_contact_value(message: Message, state: FSMContext):
             )
             return
 
-    elif contact_method in ["WhatsApp", "Звонок"]:
+    elif contact_method in ["MAX", "Звонок"]:
         if not is_valid_phone(contact_value):
             await message.answer(
                 "Пожалуйста, укажите корректный номер телефона. Пример: +79991234567."

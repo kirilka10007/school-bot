@@ -1,12 +1,30 @@
 import argparse
-import sqlite3
+import os
 import sys
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR))
 
-from shared.database import DB_PATH
+
+def _load_env() -> None:
+    env_path = ROOT_DIR / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env()
+
+from shared.database import get_db_backend_name, get_existing_tables, init_db
 
 
 REQUIRED_TABLES = {
@@ -22,15 +40,9 @@ REQUIRED_TABLES = {
 
 
 def run_healthcheck() -> tuple[bool, str]:
-    if not DB_PATH.exists():
-        return False, f"DB not found: {DB_PATH}"
-
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = {row[0] for row in cur.fetchall()}
-        conn.close()
+        init_db()
+        tables = get_existing_tables()
     except Exception as exc:
         return False, f"DB connection failed: {exc}"
 
@@ -38,7 +50,7 @@ def run_healthcheck() -> tuple[bool, str]:
     if missing:
         return False, f"Missing tables: {', '.join(missing)}"
 
-    return True, "OK"
+    return True, f"OK ({get_db_backend_name()})"
 
 
 def main() -> int:

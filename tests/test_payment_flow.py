@@ -114,3 +114,35 @@ def test_recent_payment_history_for_student(db):
     assert history[1][0] == approved_payment_id
     assert history[1][1] == "approved"
     assert history[1][5] == 4
+
+
+def test_attendance_writeoff_can_create_debt(db):
+    student_id = db.add_student(
+        full_name="Olga Sidorova",
+        telegram_id=10004,
+        phone="+79990004455",
+    )
+    teacher_id = db.add_teacher_if_not_exists("Irina Volkova", telegram_id=20004)
+    db.add_student_lesson(
+        student_id=student_id,
+        teacher_id=teacher_id,
+        subject_name="Mathematics",
+        lesson_balance=0,
+        tariff_type="single",
+    )
+    direction_id = db.get_student_directions(student_id)[0][0]
+
+    db.mark_attendance(
+        direction_id=direction_id,
+        status="present",
+        marked_by=90001,
+    )
+
+    updated_direction = db.get_student_lesson_by_id(direction_id)
+    assert updated_direction is not None
+    assert updated_direction[4] == -1
+
+    history = db.get_balance_history_by_student(student_id)
+    assert len(history) == 1
+    assert history[0][4] == "attendance_writeoff"
+    assert history[0][5] == -1

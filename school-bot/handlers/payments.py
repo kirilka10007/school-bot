@@ -1,8 +1,9 @@
 from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
+import os
 
-from config import PAYMENTS_CHAT_ID
+from config import ADMIN_ID, PAYMENTS_CHAT_ID
 from keyboards import (
     get_payment_check_keyboard,
     get_payment_direction_keyboard,
@@ -13,6 +14,7 @@ from shared.database import (
     finalize_payment_with_topup,
     find_students_by_telegram_id,
     get_payment_request_by_id,
+    get_user_by_telegram_id,
     get_student_directions,
     get_student_lesson_by_id,
     log_admin_action,
@@ -25,11 +27,48 @@ from .common import build_payment_caption, show_main_menu
 router = Router()
 
 
+def _is_private_chat(message: Message) -> bool:
+    return bool(message.chat and message.chat.type == "private")
+
+
+def _is_payments_chat(message: Message) -> bool:
+    return bool(message.chat and message.chat.id == PAYMENTS_CHAT_ID)
+
+
+def _is_payment_moderator(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+
+    raw_superadmins = os.getenv("SCHOOL_ADMIN_SUPERADMINS", "")
+    if raw_superadmins:
+        for part in raw_superadmins.split(","):
+            part = part.strip()
+            if part.isdigit() and int(part) == user_id:
+                return True
+
+    user = get_user_by_telegram_id(user_id)
+    if not user:
+        return False
+
+    _, _telegram_id, _full_name, role, is_active = user
+    return bool(is_active) and role in {"admin", "superadmin"}
+
+
+def _can_manage_payments(callback: CallbackQuery) -> bool:
+    if not callback.message:
+        return False
+    return _is_payments_chat(callback.message) and _is_payment_moderator(callback.from_user.id)
+
+
 @router.callback_query(ApplicationForm.menu, lambda c: c.data == "menu_paid")
 async def menu_paid(callback: CallbackQuery, state: FSMContext):
+    if not _is_private_chat(callback.message):
+        await callback.answer("Оплату отправляйте в личном чате с ботом.", show_alert=True)
+        return
+
     await callback.message.answer(
-        "Отправь, пожалуйста, скрин или фото чека об оплате.\n\n"
-        "Если нужно вернуться в меню, нажми /start"
+        "Отправьте, пожалуйста, фото, скриншот или PDF-файл чека об оплате.\n\n"
+        "Если нужно вернуться в меню, нажмите /menu"
     )
     await state.set_state(ApplicationForm.payment_proof)
     await callback.answer()
@@ -37,15 +76,29 @@ async def menu_paid(callback: CallbackQuery, state: FSMContext):
 
 @router.message(ApplicationForm.payment_proof)
 async def get_payment_proof(message: Message, state: FSMContext):
-    if not message.photo:
-        await message.answer("Пожалуйста, отправь именно фото или скрин чека.")
+    if not _is_private_chat(message):
         return
 
     username = f"@{message.from_user.username}" if message.from_user.username else None
     caption_text = message.caption.strip() if message.caption else None
+    file_id = None
+    file_type = None
 
-    largest_photo = message.photo[-1]
-    file_id = largest_photo.file_id
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        file_type = "photo"
+    elif message.document:
+        doc = message.document
+        file_name = (doc.file_name or "").lower()
+        mime_type = (doc.mime_type or "").lower()
+        if mime_type != "application/pdf" and not file_name.endswith(".pdf"):
+            await message.answer("Пожалуйста, отправьте PDF-файл чека.")
+            return
+        file_id = doc.file_id
+        file_type = "pdf"
+    else:
+        await message.answer("Пожалуйста, отправьте фото или PDF-файл чека.")
+        return
 
     payment_request_id = create_payment_request(
         telegram_user_id=message.from_user.id,
@@ -53,7 +106,7 @@ async def get_payment_proof(message: Message, state: FSMContext):
         telegram_full_name=message.from_user.full_name,
         caption_text=caption_text,
         file_id=file_id,
-        file_type="photo",
+        file_type=file_type,
     )
 
     payment_text = build_payment_caption(
@@ -65,23 +118,34 @@ async def get_payment_proof(message: Message, state: FSMContext):
         status_text="⏳ Ожидает проверки",
     )
 
-    await message.bot.send_photo(
-        PAYMENTS_CHAT_ID,
-        photo=file_id,
-        caption=payment_text,
-        parse_mode="HTML",
-        reply_markup=get_payment_check_keyboard(payment_request_id),
-    )
+    if file_type == "pdf":
+        await message.bot.send_document(
+            PAYMENTS_CHAT_ID,
+            document=file_id,
+            caption=payment_text,
+            parse_mode="HTML",
+            reply_markup=get_payment_check_keyboard(payment_request_id),
+        )
+    else:
+        await message.bot.send_photo(
+            PAYMENTS_CHAT_ID,
+            photo=file_id,
+            caption=payment_text,
+            parse_mode="HTML",
+            reply_markup=get_payment_check_keyboard(payment_request_id),
+        )
 
-    await message.answer("Спасибо, чек отправлен. Мы проверим оплату и сообщим результат.")
+    await message.answer("Спасибо, чек отправлен. После проверки мы сообщим результат.")
     await show_main_menu(message, state)
 
 
 @router.callback_query(lambda c: c.data.startswith("payment_reject_"))
 async def reject_payment_request(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    payment_request_id = int(parts[2])
+    if not _can_manage_payments(callback):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
 
+    payment_request_id = int(callback.data.split("_")[2])
     payment = get_payment_request_by_id(payment_request_id)
     if not payment:
         await callback.answer("Запрос оплаты не найден", show_alert=True)
@@ -164,9 +228,11 @@ async def reject_payment_request(callback: CallbackQuery):
 
 @router.callback_query(lambda c: c.data.startswith("payment_approve_"))
 async def approve_payment_request(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    payment_request_id = int(parts[2])
+    if not _can_manage_payments(callback):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
 
+    payment_request_id = int(callback.data.split("_")[2])
     payment = get_payment_request_by_id(payment_request_id)
     if not payment:
         await callback.answer("Запрос оплаты не найден", show_alert=True)
@@ -190,48 +256,25 @@ async def approve_payment_request(callback: CallbackQuery):
     if status == "approved":
         await callback.answer("Эта оплата уже подтверждена", show_alert=True)
         return
-
     if status == "rejected":
         await callback.answer("Эта оплата уже отклонена", show_alert=True)
         return
-
     if not telegram_user_id:
-        await callback.message.answer(
-            f"⚠️ У оплаты #{payment_request_id} нет Telegram ID.\n"
-            "Автоматически найти ученика нельзя."
-        )
-        await callback.answer()
+        await callback.answer("У оплаты нет Telegram ID", show_alert=True)
         return
 
     students = find_students_by_telegram_id(telegram_user_id)
-
     if not students:
-        await callback.message.answer(
-            f"⚠️ Ученик по Telegram ID <code>{telegram_user_id}</code> не найден в базе.\n"
-            "Нужно сначала добавить ученика во внутреннем боте.",
-            parse_mode="HTML",
-        )
-        await callback.answer()
+        await callback.answer("Ученик не найден по Telegram ID", show_alert=True)
         return
-
     if len(students) > 1:
-        await callback.message.answer(
-            f"⚠️ По Telegram ID <code>{telegram_user_id}</code> найдено несколько учеников.\n"
-            "Нужно проверить вручную во внутреннем боте.",
-            parse_mode="HTML",
-        )
-        await callback.answer()
+        await callback.answer("Найдено несколько учеников с этим Telegram ID", show_alert=True)
         return
 
     student_id, student_name, _, _ = students[0]
     directions = get_student_directions(student_id)
-
     if not directions:
-        await callback.message.answer(
-            f"⚠️ У ученика {student_name} пока нет направлений.\n"
-            "Сначала добавьте направление и преподавателя для этого ученика во внутреннем боте."
-        )
-        await callback.answer()
+        await callback.answer("У ученика нет направлений для начисления", show_alert=True)
         return
 
     transitioned = try_transition_payment_request_status(
@@ -244,7 +287,7 @@ async def approve_payment_request(callback: CallbackQuery):
         payment_latest = get_payment_request_by_id(payment_request_id)
         latest_status = payment_latest[7] if payment_latest else "unknown"
         await callback.answer(
-            f"Эту оплату уже обрабатывают или обработали (статус: {latest_status})",
+            f"Эта оплата уже обрабатывается или обработана (статус: {latest_status})",
             show_alert=True,
         )
         return
@@ -258,7 +301,7 @@ async def approve_payment_request(callback: CallbackQuery):
         status="success",
     )
 
-    processing_caption = build_payment_caption(
+    caption = build_payment_caption(
         payment_request_id=payment_request_id,
         full_name=telegram_full_name,
         username=telegram_username,
@@ -267,41 +310,49 @@ async def approve_payment_request(callback: CallbackQuery):
         status_text="🔄 В обработке",
     )
 
-    try:
-        await callback.message.edit_caption(caption=processing_caption, parse_mode="HTML")
-    except Exception:
-        pass
-
     if len(directions) == 1:
         direction_id, teacher_name, subject_name, lesson_balance, _ = directions[0]
-
-        await callback.message.answer(
-            f"✅ Оплата #{payment_request_id} принята в обработку.\n\n"
+        caption += (
+            "\n\n"
             f"Ученик: {student_name}\n"
-            f"Направление определено автоматически:\n"
-            f"{subject_name} — {teacher_name}\n"
+            f"Направление: {subject_name} — {teacher_name}\n"
             f"Текущий остаток: {lesson_balance}\n\n"
-            "Выберите, сколько занятий начислить:",
-            reply_markup=get_payment_topup_keyboard(payment_request_id, direction_id),
+            "Выберите, сколько занятий начислить:"
         )
+        try:
+            await callback.message.edit_caption(caption=caption, parse_mode="HTML")
+            await callback.message.edit_reply_markup(
+                reply_markup=get_payment_topup_keyboard(payment_request_id, direction_id)
+            )
+        except Exception:
+            pass
         await callback.answer("Направление выбрано автоматически")
         return
 
-    await callback.message.answer(
-        f"✅ Оплата #{payment_request_id} принята в обработку.\n\n"
+    caption += (
+        "\n\n"
         f"Ученик: {student_name}\n"
-        "Выбери направление для начисления:",
-        reply_markup=get_payment_direction_keyboard(payment_request_id, directions),
+        "Выберите направление для начисления:"
     )
-
-    await callback.answer("Выбери направление")
+    try:
+        await callback.message.edit_caption(caption=caption, parse_mode="HTML")
+        await callback.message.edit_reply_markup(
+            reply_markup=get_payment_direction_keyboard(payment_request_id, directions)
+        )
+    except Exception:
+        pass
+    await callback.answer("Выберите направление")
 
 
 @router.callback_query(lambda c: c.data.startswith("paydir_"))
 async def choose_payment_direction(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    payment_request_id = int(parts[1])
-    direction_id = int(parts[2])
+    if not _can_manage_payments(callback):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+
+    _, payment_request_id_raw, direction_id_raw = callback.data.split("_")
+    payment_request_id = int(payment_request_id_raw)
+    direction_id = int(direction_id_raw)
 
     payment = get_payment_request_by_id(payment_request_id)
     if not payment:
@@ -313,25 +364,57 @@ async def choose_payment_direction(callback: CallbackQuery):
         await callback.answer("Направление не найдено", show_alert=True)
         return
 
-    _, _, _, subject_name, lesson_balance, _, student_name, teacher_name = lesson
+    _, _, _, subject_name, lesson_balance, _, _student_name, teacher_name = lesson
+    (
+        _,
+        telegram_user_id,
+        telegram_username,
+        telegram_full_name,
+        caption_text,
+        _file_id,
+        _file_type,
+        _status,
+        _approved_by,
+        _rejected_by,
+        _created_at,
+        _updated_at,
+    ) = payment
 
-    await callback.message.answer(
-        f"Ученик: {student_name}\n"
-        f"Предмет: {subject_name}\n"
-        f"Преподаватель: {teacher_name}\n"
-        f"Текущий баланс: {lesson_balance}\n\n"
-        "Выберите, сколько занятий начислить:",
-        reply_markup=get_payment_topup_keyboard(payment_request_id, direction_id),
+    caption = build_payment_caption(
+        payment_request_id=payment_request_id,
+        full_name=telegram_full_name,
+        username=telegram_username,
+        telegram_user_id=telegram_user_id,
+        caption_text=caption_text,
+        status_text="🔄 В обработке",
     )
+    caption += (
+        "\n\n"
+        f"Выбрано направление: {subject_name} — {teacher_name}\n"
+        f"Текущий остаток: {lesson_balance}\n\n"
+        "Выберите, сколько занятий начислить:"
+    )
+
+    try:
+        await callback.message.edit_caption(caption=caption, parse_mode="HTML")
+        await callback.message.edit_reply_markup(
+            reply_markup=get_payment_topup_keyboard(payment_request_id, direction_id)
+        )
+    except Exception:
+        pass
 
     await callback.answer()
 
 
 @router.callback_query(lambda c: c.data.startswith("paymanual_"))
 async def manual_payment_topup_start(callback: CallbackQuery, state: FSMContext):
-    parts = callback.data.split("_")
-    payment_request_id = int(parts[1])
-    direction_id = int(parts[2])
+    if not _can_manage_payments(callback):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+
+    _, payment_request_id_raw, direction_id_raw = callback.data.split("_")
+    payment_request_id = int(payment_request_id_raw)
+    direction_id = int(direction_id_raw)
 
     payment = get_payment_request_by_id(payment_request_id)
     if not payment:
@@ -344,9 +427,9 @@ async def manual_payment_topup_start(callback: CallbackQuery, state: FSMContext)
         return
 
     _, _, _, subject_name, lesson_balance, _, student_name, teacher_name = lesson
-
     await state.update_data(
-        manual_payment_request_id=payment_request_id, manual_direction_id=direction_id
+        manual_payment_request_id=payment_request_id,
+        manual_direction_id=direction_id,
     )
 
     await callback.message.answer(
@@ -354,7 +437,7 @@ async def manual_payment_topup_start(callback: CallbackQuery, state: FSMContext)
         f"Предмет: {subject_name}\n"
         f"Преподаватель: {teacher_name}\n"
         f"Текущий баланс: {lesson_balance}\n\n"
-        "Введи вручную, сколько занятий начислить:"
+        "Введите вручную, сколько занятий начислить:"
     )
     await state.set_state(ApplicationForm.payment_manual_amount)
     await callback.answer()
@@ -362,10 +445,14 @@ async def manual_payment_topup_start(callback: CallbackQuery, state: FSMContext)
 
 @router.callback_query(lambda c: c.data.startswith("payadd_"))
 async def add_lessons_after_payment(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    payment_request_id = int(parts[1])
-    direction_id = int(parts[2])
-    lessons_to_add = int(parts[3])
+    if not _can_manage_payments(callback):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+
+    _, payment_request_id_raw, direction_id_raw, lessons_to_add_raw = callback.data.split("_")
+    payment_request_id = int(payment_request_id_raw)
+    direction_id = int(direction_id_raw)
+    lessons_to_add = int(lessons_to_add_raw)
 
     payment = get_payment_request_by_id(payment_request_id)
     if not payment:
@@ -446,7 +533,7 @@ async def add_lessons_after_payment(callback: CallbackQuery):
     _, _, _, _, lesson_balance_after, _, _, _ = updated_lesson
 
     await callback.message.answer(
-        f"✅ Оплата #{payment_request_id} подтверждена и обработана\n\n"
+        f"✅ Оплата #{payment_request_id} подтверждена\n\n"
         f"Ученик: {student_name}\n"
         f"Предмет: {subject_name}\n"
         f"Преподаватель: {teacher_name}\n"
@@ -472,10 +559,12 @@ async def add_lessons_after_payment(callback: CallbackQuery):
 
 @router.message(ApplicationForm.payment_manual_amount)
 async def process_manual_payment_amount(message: Message, state: FSMContext):
-    text = message.text.strip()
+    if not _is_payments_chat(message) or not _is_payment_moderator(message.from_user.id):
+        return
 
+    text = message.text.strip()
     if not text.isdigit():
-        await message.answer("Введи количество занятий числом.")
+        await message.answer("Введите количество занятий числом.")
         return
 
     lessons_to_add = int(text)
@@ -486,7 +575,6 @@ async def process_manual_payment_amount(message: Message, state: FSMContext):
     data = await state.get_data()
     payment_request_id = data.get("manual_payment_request_id")
     direction_id = data.get("manual_direction_id")
-
     if not payment_request_id or not direction_id:
         await message.answer("Не удалось получить данные для начисления.")
         await state.clear()
@@ -558,7 +646,7 @@ async def process_manual_payment_amount(message: Message, state: FSMContext):
     _, _, _, _, lesson_balance_after, _, _, _ = updated_lesson
 
     await message.answer(
-        f"✅ Оплата #{payment_request_id} подтверждена и обработана\n\n"
+        f"✅ Оплата #{payment_request_id} подтверждена\n\n"
         f"Ученик: {student_name}\n"
         f"Предмет: {subject_name}\n"
         f"Преподаватель: {teacher_name}\n"

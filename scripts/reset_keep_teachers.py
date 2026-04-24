@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 
+from shared.database import init_db, reset_system_data_keep_current_teachers
+
 
 def _load_env() -> None:
     env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -11,23 +13,14 @@ def _load_env() -> None:
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-
         if key and key not in os.environ:
             os.environ[key] = value
 
 
-def _require(key: str) -> str:
-    value = os.getenv(key)
-    if not value:
-        raise RuntimeError(f"Missing required env var: {key}")
-    return value
-
-
-def _parse_int_list(raw: str) -> list[int]:
+def _parse_superadmins(raw: str) -> list[int]:
     result: list[int] = []
     for part in raw.split(","):
         part = part.strip()
@@ -35,16 +28,21 @@ def _parse_int_list(raw: str) -> list[int]:
             continue
         try:
             result.append(int(part))
-        except ValueError as exc:
-            raise RuntimeError(f"SCHOOL_ADMIN_SUPERADMINS must be comma-separated ints, got: {raw}") from exc
-    if not result:
-        raise RuntimeError("SCHOOL_ADMIN_SUPERADMINS must contain at least one id")
+        except ValueError:
+            continue
     return result
 
 
-_load_env()
+def main() -> None:
+    _load_env()
+    init_db()
+    superadmins = _parse_superadmins(os.getenv("SCHOOL_ADMIN_SUPERADMINS", ""))
+    result = reset_system_data_keep_current_teachers(preserve_superadmin_ids=superadmins)
 
-BOT_TOKEN = _require("SCHOOL_ADMIN_BOT_TOKEN")
-SUPERADMINS = _parse_int_list(_require("SCHOOL_ADMIN_SUPERADMINS"))
-SCHOOL_BOT_TOKEN = os.getenv("SCHOOL_BOT_TOKEN", "").strip() or None
-SCHOOL_BOT_USERNAME = os.getenv("SCHOOL_BOT_USERNAME", "").strip().lstrip("@") or None
+    print("RESET_KEEP_TEACHERS_OK")
+    print(f"Superadmins preserved: {result['superadmins_preserved']}")
+    print(f"Teachers kept: {result['teachers_kept']}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,16 +1,243 @@
 import sqlite3
 import json
 import os
+import importlib.util
+import secrets
+import re
+from html import escape
 from datetime import datetime
 from pathlib import Path
+
+try:
+    import psycopg2
+except ImportError:  # pragma: no cover - optional dependency
+    psycopg2 = None
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = (BASE_DIR / "school_system.db").resolve()
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_POSTGRES = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://")
+
+
+def _replace_qmark_placeholders(sql: str) -> str:
+    result: list[str] = []
+    in_single_quote = False
+    in_double_quote = False
+    escaped = False
+
+    for ch in sql:
+        if ch == "\\" and not escaped:
+            escaped = True
+            result.append(ch)
+            continue
+
+        if ch == "'" and not in_double_quote and not escaped:
+            in_single_quote = not in_single_quote
+            result.append(ch)
+            continue
+
+        if ch == '"' and not in_single_quote and not escaped:
+            in_double_quote = not in_double_quote
+            result.append(ch)
+            continue
+
+        if ch == "?" and not in_single_quote and not in_double_quote:
+            result.append("%s")
+        else:
+            result.append(ch)
+        escaped = False
+
+    return "".join(result)
+
+
+def _adapt_sql_for_postgres(sql: str) -> str:
+    adapted = sql
+    adapted = adapted.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+    if re.search(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", adapted, flags=re.IGNORECASE):
+        adapted = re.sub(
+            r"\bINSERT\s+OR\s+IGNORE\s+INTO\b",
+            "INSERT INTO",
+            adapted,
+            flags=re.IGNORECASE,
+        )
+        if "ON CONFLICT" not in adapted.upper():
+            adapted = adapted.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+
+    if re.search(
+        r"\bINSERT\s+OR\s+REPLACE\s+INTO\s+debt_daily_snapshots\b",
+        adapted,
+        flags=re.IGNORECASE,
+    ):
+        adapted = re.sub(
+            r"\bINSERT\s+OR\s+REPLACE\s+INTO\b",
+            "INSERT INTO",
+            adapted,
+            flags=re.IGNORECASE,
+        )
+        if "ON CONFLICT" not in adapted.upper():
+            adapted = (
+                adapted.rstrip().rstrip(";")
+                + " ON CONFLICT (snapshot_date, student_lesson_id)"
+                + " DO UPDATE SET lesson_balance = EXCLUDED.lesson_balance"
+            )
+
+    if re.search(
+        r"\bINSERT\s+OR\s+REPLACE\s+INTO\s+debt_report_runs\b",
+        adapted,
+        flags=re.IGNORECASE,
+    ):
+        adapted = re.sub(
+            r"\bINSERT\s+OR\s+REPLACE\s+INTO\b",
+            "INSERT INTO",
+            adapted,
+            flags=re.IGNORECASE,
+        )
+        if "ON CONFLICT" not in adapted.upper():
+            adapted = (
+                adapted.rstrip().rstrip(";")
+                + " ON CONFLICT (report_date)"
+                + " DO UPDATE SET sent_at = EXCLUDED.sent_at"
+            )
+
+    return _replace_qmark_placeholders(adapted)
+
+
+class PostgresCursorCompat:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self._manual_rows = None
+        self._lastrowid = None
+
+    @property
+    def rowcount(self):
+        if self._manual_rows is not None:
+            return len(self._manual_rows)
+        return self._cursor.rowcount
+
+    @staticmethod
+    def _extract_pragma_table_name(sql: str) -> str | None:
+        match = re.match(r"^\s*PRAGMA\s+table_info\(([^)]+)\)\s*$", sql, flags=re.IGNORECASE)
+        if not match:
+            return None
+        return match.group(1).strip().strip('"').strip("'")
+
+    def execute(self, sql: str, params=()):
+        table_name = self._extract_pragma_table_name(sql)
+        if table_name:
+            self._cursor.execute(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table_name,),
+            )
+            rows = self._cursor.fetchall()
+            self._manual_rows = [
+                (idx, row[0], row[1], 0, None, 0)
+                for idx, row in enumerate(rows)
+            ]
+            self._lastrowid = None
+            return self
+
+        self._manual_rows = None
+        adapted_sql = _adapt_sql_for_postgres(sql)
+        self._cursor.execute(adapted_sql, params)
+        self._lastrowid = None
+        if re.match(r"^\s*INSERT\s+INTO\b", adapted_sql, flags=re.IGNORECASE):
+            try:
+                self._cursor.execute("SAVEPOINT sp_lastrowid")
+                self._cursor.execute("SELECT LASTVAL()")
+                row = self._cursor.fetchone()
+                self._lastrowid = row[0] if row else None
+                self._cursor.execute("RELEASE SAVEPOINT sp_lastrowid")
+            except Exception:
+                try:
+                    self._cursor.execute("ROLLBACK TO SAVEPOINT sp_lastrowid")
+                    self._cursor.execute("RELEASE SAVEPOINT sp_lastrowid")
+                except Exception:
+                    pass
+                self._lastrowid = None
+        return self
+
+    def fetchall(self):
+        if self._manual_rows is not None:
+            return self._manual_rows
+        return self._cursor.fetchall()
+
+    def fetchone(self):
+        if self._manual_rows is not None:
+            if not self._manual_rows:
+                return None
+            return self._manual_rows.pop(0)
+        return self._cursor.fetchone()
+
+    def __getattr__(self, item):
+        return getattr(self._cursor, item)
+
+    @property
+    def lastrowid(self):
+        return self._lastrowid
+
+
+class PostgresConnectionCompat:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def cursor(self):
+        return PostgresCursorCompat(self._connection.cursor())
+
+    def commit(self):
+        self._connection.commit()
+
+    def close(self):
+        self._connection.close()
+
+    def rollback(self):
+        self._connection.rollback()
+
+    def __getattr__(self, item):
+        return getattr(self._connection, item)
 
 
 def get_connection():
-    return sqlite3.connect(DB_PATH)
+    if USE_POSTGRES:
+        if psycopg2 is None:
+            raise RuntimeError(
+                "DATABASE_URL is set, but psycopg2 is not installed. Install dependencies from requirements.txt."
+            )
+        conn = psycopg2.connect(DATABASE_URL)
+        return PostgresConnectionCompat(conn)
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def get_db_backend_name() -> str:
+    return "postgresql" if USE_POSTGRES else "sqlite"
+
+
+def get_existing_tables() -> set[str]:
+    conn = get_connection()
+    cur = conn.cursor()
+    if USE_POSTGRES:
+        cur.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_type = 'BASE TABLE'
+            """
+        )
+    else:
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    rows = cur.fetchall()
+    conn.close()
+    return {str(row[0]) for row in rows if row and row[0]}
 
 
 def init_db():
@@ -25,6 +252,7 @@ def init_db():
         phone TEXT
     )
     """)
+    _ensure_students_table_columns(cur)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
@@ -36,6 +264,7 @@ def init_db():
         created_at TEXT NOT NULL
     )
     """)
+    _ensure_users_table_columns(cur)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS teachers (
@@ -44,6 +273,19 @@ def init_db():
         full_name TEXT NOT NULL
     )
     """)
+    _ensure_teachers_table_columns(cur)
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS teacher_subjects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            teacher_id INTEGER NOT NULL,
+            subject_name TEXT NOT NULL,
+            UNIQUE(teacher_id, subject_name),
+            FOREIGN KEY(teacher_id) REFERENCES teachers(id)
+        )
+        """
+    )
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS student_lessons (
@@ -117,6 +359,26 @@ def init_db():
 
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS publication_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_by INTEGER NOT NULL,
+            audience TEXT NOT NULL DEFAULT 'students',
+            description TEXT NOT NULL,
+            photo_file_id TEXT,
+            links_json TEXT,
+            status TEXT NOT NULL DEFAULT 'scheduled',
+            scheduled_for TEXT NOT NULL,
+            sent_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT,
+            last_error TEXT
+        )
+        """
+    )
+    _ensure_publication_posts_columns(cur)
+
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS maintenance_runs (
             task_name TEXT PRIMARY KEY,
             executed_at TEXT NOT NULL
@@ -124,8 +386,177 @@ def init_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS debt_reminder_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_lesson_id INTEGER NOT NULL,
+            reminder_date TEXT NOT NULL,
+            reminded_at TEXT NOT NULL,
+            UNIQUE(student_lesson_id, reminder_date)
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS debt_daily_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_date TEXT NOT NULL,
+            student_lesson_id INTEGER NOT NULL,
+            lesson_balance INTEGER NOT NULL,
+            UNIQUE(snapshot_date, student_lesson_id)
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS debt_report_runs (
+            report_date TEXT PRIMARY KEY,
+            sent_at TEXT NOT NULL
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS known_telegram_users (
+            telegram_id INTEGER PRIMARY KEY,
+            telegram_username TEXT,
+            full_name TEXT,
+            last_seen_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_known_telegram_users_username
+        ON known_telegram_users(telegram_username)
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS onboarding_invites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT UNIQUE NOT NULL,
+            role TEXT NOT NULL,
+            full_name TEXT NOT NULL,
+            telegram_username TEXT NOT NULL,
+            entity_type TEXT,
+            entity_id INTEGER,
+            created_by INTEGER,
+            created_at TEXT NOT NULL,
+            used_by_telegram_id INTEGER,
+            used_at TEXT
+        )
+        """
+    )
+
+    _ensure_postgres_bigint_columns(cur)
+    _cleanup_teacher_profiles_for_non_teacher_users(cur)
+    conn.commit()
+    _sync_teacher_subject_links()
+    conn.close()
+    if _is_truthy_env(os.getenv("SCHOOL_SEED_TEACHERS_FROM_CATALOG", "0")):
+        sync_teachers_from_catalog()
+
+
+def _ensure_teachers_table_columns(cur: sqlite3.Cursor):
+    cur.execute("PRAGMA table_info(teachers)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+
+    if "subject_name" not in existing_columns:
+        cur.execute("ALTER TABLE teachers ADD COLUMN subject_name TEXT")
+    if "description" not in existing_columns:
+        cur.execute("ALTER TABLE teachers ADD COLUMN description TEXT")
+    if "photo_path" not in existing_columns:
+        cur.execute("ALTER TABLE teachers ADD COLUMN photo_path TEXT")
+
+
+def _ensure_publication_posts_columns(cur: sqlite3.Cursor):
+    cur.execute("PRAGMA table_info(publication_posts)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+    if "audience" not in existing_columns:
+        cur.execute("ALTER TABLE publication_posts ADD COLUMN audience TEXT NOT NULL DEFAULT 'students'")
+
+
+def _sync_teacher_subject_links():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_name)
+        SELECT id, subject_name
+        FROM teachers
+        WHERE subject_name IS NOT NULL
+          AND TRIM(subject_name) <> ''
+        """
+    )
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_name)
+        SELECT teacher_id, subject_name
+        FROM student_lessons
+        WHERE subject_name IS NOT NULL
+          AND TRIM(subject_name) <> ''
+        """
+    )
     conn.commit()
     conn.close()
+
+
+def _ensure_students_table_columns(cur: sqlite3.Cursor):
+    cur.execute("PRAGMA table_info(students)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+    if "telegram_username" not in existing_columns:
+        cur.execute("ALTER TABLE students ADD COLUMN telegram_username TEXT")
+
+
+def _ensure_users_table_columns(cur: sqlite3.Cursor):
+    cur.execute("PRAGMA table_info(users)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+    if "telegram_username" not in existing_columns:
+        cur.execute("ALTER TABLE users ADD COLUMN telegram_username TEXT")
+
+
+def _ensure_postgres_bigint_columns(cur):
+    if not USE_POSTGRES:
+        return
+
+    bigint_columns: dict[str, set[str]] = {
+        "students": {"telegram_id"},
+        "users": {"telegram_id"},
+        "teachers": {"telegram_id"},
+        "attendance": {"marked_by"},
+        "balance_history": {"created_by"},
+        "payment_requests": {"telegram_user_id", "approved_by", "rejected_by"},
+        "admin_actions": {"admin_telegram_id"},
+        "known_telegram_users": {"telegram_id"},
+        "onboarding_invites": {"created_by", "used_by_telegram_id"},
+        "publication_posts": {"created_by"},
+    }
+
+    cur.execute(
+        """
+        SELECT table_name, column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+        """
+    )
+
+    for table_name, column_name, data_type in cur.fetchall():
+        table_rules = bigint_columns.get(str(table_name))
+        if not table_rules:
+            continue
+        if str(column_name) not in table_rules:
+            continue
+        if str(data_type).lower() == "bigint":
+            continue
+        cur.execute(
+            f"ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE BIGINT"
+        )
 
 
 def _is_truthy_env(value: str | None) -> bool:
@@ -156,6 +587,7 @@ def reset_student_data_for_testing(preserve_superadmin_ids: list[int] | tuple[in
     cur.execute("DELETE FROM student_lessons")
     cur.execute("DELETE FROM payment_requests")
     cur.execute("DELETE FROM admin_actions")
+    cur.execute("DELETE FROM onboarding_invites")
     cur.execute("DELETE FROM students")
     cur.execute("DELETE FROM users WHERE role = 'student'")
     cur.execute("DELETE FROM users WHERE role = 'admin'")
@@ -175,6 +607,270 @@ def reset_student_data_for_testing(preserve_superadmin_ids: list[int] | tuple[in
 
     conn.commit()
     conn.close()
+
+
+def load_teacher_cards_from_catalog() -> list[dict]:
+    data_path = BASE_DIR.parent / "school-bot" / "data.py"
+    if not data_path.exists():
+        return []
+
+    try:
+        spec = importlib.util.spec_from_file_location("school_bot_data", data_path)
+        if spec is None or spec.loader is None:
+            return []
+
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        teachers_data = getattr(module, "TEACHERS_DATA", {})
+    except Exception:
+        return []
+
+    cards: list[dict] = []
+    for subject_name, subject_teachers in teachers_data.items():
+        for teacher in subject_teachers:
+            name = teacher.get("name")
+            if not name:
+                continue
+            cards.append(
+                {
+                    "full_name": name,
+                    "subject_name": subject_name,
+                    "description": teacher.get("description"),
+                    "photo_path": teacher.get("photo"),
+                    "telegram_id": teacher.get("telegram_id"),
+                }
+            )
+    return cards
+
+
+def load_teacher_names_from_catalog() -> list[str]:
+    cards = load_teacher_cards_from_catalog()
+    names: list[str] = []
+    for card in cards:
+        name = card.get("full_name")
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def sync_teachers_from_catalog() -> int:
+    cards = load_teacher_cards_from_catalog()
+    if not cards:
+        return 0
+
+    conn = get_connection()
+    cur = conn.cursor()
+    inserted = 0
+    for card in cards:
+        full_name = card.get("full_name")
+        subject_name = card.get("subject_name")
+        description = card.get("description")
+        photo_path = card.get("photo_path")
+        telegram_id = card.get("telegram_id")
+        cur.execute(
+            "SELECT id FROM teachers WHERE full_name = ? AND COALESCE(subject_name, '') = COALESCE(?, '')",
+            (full_name, subject_name),
+        )
+        exists = cur.fetchone()
+        if exists:
+            cur.execute(
+                """
+                UPDATE teachers
+                SET description = COALESCE(description, ?),
+                    photo_path = COALESCE(photo_path, ?)
+                WHERE id = ?
+                """,
+                (description, photo_path, exists[0]),
+            )
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_name)
+                VALUES (?, ?)
+                """,
+                (exists[0], subject_name),
+            )
+            continue
+        cur.execute(
+            """
+            INSERT INTO teachers (telegram_id, full_name, subject_name, description, photo_path)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (telegram_id, full_name, subject_name, description, photo_path),
+        )
+        teacher_id = int(cur.lastrowid)
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_name)
+            VALUES (?, ?)
+            """,
+            (teacher_id, subject_name),
+        )
+        inserted += 1
+
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def reset_system_data_and_seed_teachers(
+    preserve_superadmin_ids: list[int] | tuple[int, ...] | None = None,
+) -> dict:
+    preserve_superadmin_ids = tuple(preserve_superadmin_ids or [])
+    teacher_cards = load_teacher_cards_from_catalog()
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+
+    cur.execute("DELETE FROM attendance")
+    cur.execute("DELETE FROM balance_history")
+    cur.execute("DELETE FROM student_lessons")
+    cur.execute("DELETE FROM payment_requests")
+    cur.execute("DELETE FROM admin_actions")
+    cur.execute("DELETE FROM onboarding_invites")
+    cur.execute("DELETE FROM students")
+
+    cur.execute("DELETE FROM users WHERE role IN ('student', 'admin', 'teacher')")
+
+    if preserve_superadmin_ids:
+        placeholders = ",".join("?" for _ in preserve_superadmin_ids)
+        cur.execute(
+            f"""
+            DELETE FROM users
+            WHERE role = 'superadmin'
+              AND telegram_id NOT IN ({placeholders})
+            """,
+            preserve_superadmin_ids,
+        )
+    else:
+        cur.execute("DELETE FROM users WHERE role = 'superadmin'")
+
+    cur.execute("DELETE FROM teacher_subjects")
+    cur.execute("DELETE FROM teachers")
+    for card in teacher_cards:
+        cur.execute(
+            """
+            INSERT INTO teachers (telegram_id, full_name, subject_name, description, photo_path)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                card.get("telegram_id"),
+                card.get("full_name"),
+                card.get("subject_name"),
+                card.get("description"),
+                card.get("photo_path"),
+            ),
+        )
+        teacher_id = int(cur.lastrowid)
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_name)
+            VALUES (?, ?)
+            """,
+            (teacher_id, card.get("subject_name")),
+        )
+
+    # Drop legacy tables if they exist from old revisions.
+    cur.execute("DROP TABLE IF EXISTS applications")
+    cur.execute("DROP TABLE IF EXISTS lessons")
+    cur.execute("DROP TABLE IF EXISTS payments")
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "teachers_seeded": len(teacher_cards),
+        "superadmins_preserved": len(preserve_superadmin_ids),
+    }
+
+
+def reset_system_data_keep_current_teachers(
+    preserve_superadmin_ids: list[int] | tuple[int, ...] | None = None,
+) -> dict:
+    preserve_superadmin_ids = tuple(preserve_superadmin_ids or [])
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+
+    cur.execute("DELETE FROM attendance")
+    cur.execute("DELETE FROM balance_history")
+    cur.execute("DELETE FROM student_lessons")
+    cur.execute("DELETE FROM payment_requests")
+    cur.execute("DELETE FROM admin_actions")
+    cur.execute("DELETE FROM onboarding_invites")
+    cur.execute("DELETE FROM debt_reminder_log")
+    cur.execute("DELETE FROM debt_daily_snapshots")
+    cur.execute("DELETE FROM debt_report_runs")
+    cur.execute("DELETE FROM students")
+
+    # Keep teacher profiles and their accounts; clear only admins/students.
+    cur.execute("DELETE FROM users WHERE role IN ('student', 'admin')")
+
+    if preserve_superadmin_ids:
+        placeholders = ",".join("?" for _ in preserve_superadmin_ids)
+        cur.execute(
+            f"""
+            DELETE FROM users
+            WHERE role = 'superadmin'
+              AND telegram_id NOT IN ({placeholders})
+            """,
+            preserve_superadmin_ids,
+        )
+    else:
+        cur.execute("DELETE FROM users WHERE role = 'superadmin'")
+
+    cur.execute("SELECT COUNT(1) FROM teachers")
+    teachers_kept = int(cur.fetchone()[0] or 0)
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "teachers_kept": teachers_kept,
+        "superadmins_preserved": len(preserve_superadmin_ids),
+    }
+
+
+def reset_all_system_data() -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+
+    table_order = [
+        "attendance",
+        "balance_history",
+        "student_lessons",
+        "payment_requests",
+        "admin_actions",
+        "onboarding_invites",
+        "debt_reminder_log",
+        "debt_daily_snapshots",
+        "debt_report_runs",
+        "teacher_subjects",
+        "students",
+        "teachers",
+        "users",
+        "known_telegram_users",
+        "maintenance_runs",
+    ]
+
+    deleted: dict[str, int] = {}
+    for table_name in table_order:
+        cur.execute(f"DELETE FROM {table_name}")
+        deleted[table_name] = int(cur.rowcount or 0)
+
+    cur.execute("DROP TABLE IF EXISTS applications")
+    cur.execute("DROP TABLE IF EXISTS lessons")
+    cur.execute("DROP TABLE IF EXISTS payments")
+
+    if not USE_POSTGRES:
+        for table_name in table_order:
+            cur.execute("DELETE FROM sqlite_sequence WHERE name = ?", (table_name,))
+
+    conn.commit()
+    conn.close()
+    return deleted
 
 
 def run_startup_maintenance_from_env(preserve_superadmin_ids: list[int] | tuple[int, ...] | None = None) -> bool:
@@ -214,7 +910,12 @@ def run_startup_maintenance_from_env(preserve_superadmin_ids: list[int] | tuple[
     return True
 
 
-def add_student(full_name: str, telegram_id: int | None, phone: str | None):
+def add_student(
+    full_name: str,
+    telegram_id: int | None,
+    phone: str | None,
+    telegram_username: str | None = None,
+):
     conn = get_connection()
     cur = conn.cursor()
 
@@ -235,10 +936,10 @@ def add_student(full_name: str, telegram_id: int | None, phone: str | None):
             cur.execute(
                 """
                 UPDATE students
-                SET full_name = ?, phone = ?
+                SET full_name = ?, phone = ?, telegram_username = COALESCE(?, telegram_username)
                 WHERE id = ?
                 """,
-                (full_name, phone, existing[0])
+                (full_name, phone, telegram_username, existing[0])
             )
             conn.commit()
             conn.close()
@@ -246,10 +947,10 @@ def add_student(full_name: str, telegram_id: int | None, phone: str | None):
 
     cur.execute(
         """
-        INSERT INTO students (full_name, telegram_id, phone)
-        VALUES (?, ?, ?)
+        INSERT INTO students (full_name, telegram_id, phone, telegram_username)
+        VALUES (?, ?, ?, ?)
         """,
-        (full_name, telegram_id, phone)
+        (full_name, telegram_id, phone, telegram_username)
     )
 
     student_id = cur.lastrowid
@@ -317,9 +1018,154 @@ def add_teacher_if_not_exists(full_name: str, telegram_id: int | None = None):
     return teacher_id
 
 
+def ensure_teacher_subject_link(teacher_id: int, subject_name: str):
+    normalized_subject = (subject_name or "").strip()
+    if not normalized_subject:
+        return
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_name)
+        VALUES (?, ?)
+        """,
+        (teacher_id, normalized_subject),
+    )
+    conn.commit()
+    conn.close()
+
+
+def replace_teacher_subject_links(teacher_id: int, subject_name: str):
+    normalized_subject = (subject_name or "").strip()
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        DELETE FROM teacher_subjects
+        WHERE teacher_id = ?
+        """,
+        (teacher_id,),
+    )
+    if normalized_subject:
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_name)
+            VALUES (?, ?)
+            """,
+            (teacher_id, normalized_subject),
+        )
+    conn.commit()
+    conn.close()
+
+
+def add_or_update_teacher_profile(
+    *,
+    full_name: str,
+    subject_name: str,
+    telegram_id: int | None = None,
+    description: str | None = None,
+    photo_path: str | None = None,
+) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+
+    if telegram_id is not None:
+        cur.execute(
+            """
+            UPDATE students
+            SET telegram_id = NULL
+            WHERE telegram_id = ?
+            """,
+            (telegram_id,),
+        )
+
+    if telegram_id is not None:
+        cur.execute(
+            """
+            SELECT id
+            FROM teachers
+            WHERE telegram_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (telegram_id,),
+        )
+        same_telegram_row = cur.fetchone()
+        if same_telegram_row:
+            teacher_id = int(same_telegram_row[0])
+            cur.execute(
+                """
+                UPDATE teachers
+                SET full_name = ?,
+                    subject_name = ?,
+                    description = COALESCE(?, description),
+                    photo_path = COALESCE(?, photo_path)
+                WHERE id = ?
+                """,
+                (full_name, subject_name, description, photo_path, teacher_id),
+            )
+            conn.commit()
+            conn.close()
+            replace_teacher_subject_links(teacher_id, subject_name)
+            return teacher_id
+
+    cur.execute(
+        """
+        SELECT id
+        FROM teachers
+        WHERE full_name = ?
+          AND COALESCE(subject_name, '') = COALESCE(?, '')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (full_name, subject_name),
+    )
+    row = cur.fetchone()
+
+    if row:
+        teacher_id = int(row[0])
+        cur.execute(
+            """
+            UPDATE teachers
+            SET telegram_id = COALESCE(?, telegram_id),
+                description = COALESCE(?, description),
+                photo_path = COALESCE(?, photo_path)
+            WHERE id = ?
+            """,
+            (telegram_id, description, photo_path, teacher_id),
+        )
+        conn.commit()
+        conn.close()
+        ensure_teacher_subject_link(teacher_id, subject_name)
+        return teacher_id
+
+    cur.execute(
+        """
+        INSERT INTO teachers (telegram_id, full_name, subject_name, description, photo_path)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (telegram_id, full_name, subject_name, description, photo_path),
+    )
+    teacher_id = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    replace_teacher_subject_links(teacher_id, subject_name)
+    return teacher_id
+
+
 def bind_teacher_telegram_id(full_name: str, telegram_id: int):
     conn = get_connection()
     cur = conn.cursor()
+
+    cur.execute(
+        """
+        UPDATE students
+        SET telegram_id = NULL
+        WHERE telegram_id = ?
+        """,
+        (telegram_id,),
+    )
 
     cur.execute(
         """
@@ -373,6 +1219,31 @@ def bind_teacher_telegram_id(full_name: str, telegram_id: int):
     conn.commit()
     conn.close()
     return {"ok": True, "teacher_id": teacher_id, "action": action}
+
+
+def bind_teacher_telegram_by_id(teacher_id: int, telegram_id: int) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE students
+        SET telegram_id = NULL
+        WHERE telegram_id = ?
+        """,
+        (telegram_id,),
+    )
+    cur.execute(
+        """
+        UPDATE teachers
+        SET telegram_id = ?
+        WHERE id = ?
+        """,
+        (telegram_id, teacher_id),
+    )
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
 
 
 def get_teacher_by_telegram_id(telegram_id: int):
@@ -596,10 +1467,7 @@ def mark_attendance(direction_id: int, status: str, marked_by: int):
         cur.execute(
             """
             UPDATE student_lessons
-            SET lesson_balance = CASE
-                WHEN lesson_balance > 0 THEN lesson_balance - 1
-                ELSE 0
-            END
+            SET lesson_balance = lesson_balance - 1
             WHERE id = ?
             """,
             (direction_id,)
@@ -720,6 +1588,24 @@ def get_payment_request_by_id(payment_request_id: int):
     return row
 
 
+def get_student_by_id(student_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT id, full_name, telegram_id, phone
+        FROM students
+        WHERE id = ?
+        """,
+        (student_id,)
+    )
+    row = cur.fetchone()
+
+    conn.close()
+    return row
+
+
 def get_recent_payment_history_by_telegram_user(telegram_user_id: int, limit: int = 4):
     conn = get_connection()
     cur = conn.cursor()
@@ -737,7 +1623,7 @@ def get_recent_payment_history_by_telegram_user(telegram_user_id: int, limit: in
                     SELECT SUM(bh.lessons_delta)
                     FROM balance_history bh
                     WHERE bh.operation_type = 'manual_topup'
-                      AND bh.comment LIKE '%' || '#' || pr.id || '%'
+                      AND POSITION('#' || CAST(pr.id AS TEXT) IN COALESCE(bh.comment, '')) > 0
                 ),
                 0
             ) AS lessons_added
@@ -781,6 +1667,7 @@ def update_payment_request_status(payment_request_id: int, status: str, admin_id
 
     conn.commit()
     conn.close()
+    ensure_teacher_subject_link(teacher_id, subject_name)
 
 
 def try_transition_payment_request_status(
@@ -933,29 +1820,801 @@ def find_students_by_telegram_id(telegram_user_id: int):
     return rows
 
 
-def add_user(telegram_id: int, full_name: str, role: str):
+def add_user(
+    telegram_id: int,
+    full_name: str,
+    role: str,
+    telegram_username: str | None = None,
+):
     conn = get_connection()
     cur = conn.cursor()
 
+    # One Telegram account must not be simultaneously bound as both student and teacher.
+    if role == "teacher":
+        cur.execute(
+            """
+            UPDATE students
+            SET telegram_id = NULL
+            WHERE telegram_id = ?
+            """,
+            (telegram_id,),
+        )
+    elif role == "student":
+        cur.execute(
+            """
+            UPDATE teachers
+            SET telegram_id = NULL
+            WHERE telegram_id = ?
+            """,
+            (telegram_id,),
+        )
+
     cur.execute(
         """
-        INSERT INTO users (telegram_id, full_name, role, is_active, created_at)
-        VALUES (?, ?, ?, 1, ?)
+        INSERT INTO users (telegram_id, full_name, role, is_active, created_at, telegram_username)
+        VALUES (?, ?, ?, 1, ?, ?)
         ON CONFLICT(telegram_id) DO UPDATE SET
             full_name = excluded.full_name,
             role = excluded.role,
-            is_active = 1
+            is_active = 1,
+            telegram_username = COALESCE(excluded.telegram_username, users.telegram_username)
         """,
         (
             telegram_id,
             full_name,
             role,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            telegram_username,
         )
     )
 
     conn.commit()
     conn.close()
+
+
+def normalize_telegram_username(username: str | None) -> str | None:
+    if not username:
+        return None
+    cleaned = username.strip().lstrip("@").lower()
+    return cleaned or None
+
+
+def upsert_known_telegram_user(
+    *,
+    telegram_id: int,
+    telegram_username: str | None,
+    full_name: str | None,
+):
+    normalized_username = normalize_telegram_username(telegram_username)
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO known_telegram_users (
+            telegram_id, telegram_username, full_name, last_seen_at
+        )
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+            telegram_username = COALESCE(excluded.telegram_username, known_telegram_users.telegram_username),
+            full_name = COALESCE(excluded.full_name, known_telegram_users.full_name),
+            last_seen_at = excluded.last_seen_at
+        """,
+        (
+            telegram_id,
+            normalized_username,
+            full_name,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_known_telegram_user_id_by_username(telegram_username: str | None) -> int | None:
+    normalized_username = normalize_telegram_username(telegram_username)
+    if not normalized_username:
+        return None
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT telegram_id
+        FROM known_telegram_users
+        WHERE telegram_username = ?
+        ORDER BY last_seen_at DESC
+        LIMIT 1
+        """,
+        (normalized_username,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def create_onboarding_invite(
+    *,
+    role: str,
+    full_name: str,
+    telegram_username: str,
+    entity_type: str | None = None,
+    entity_id: int | None = None,
+    created_by: int | None = None,
+) -> str:
+    normalized_username = normalize_telegram_username(telegram_username)
+    token = secrets.token_urlsafe(18)
+    conn = get_connection()
+    cur = conn.cursor()
+
+    # Reuse an existing pending invite for the same target to avoid duplicates.
+    cur.execute(
+        """
+        SELECT token
+        FROM onboarding_invites
+        WHERE role = ?
+          AND telegram_username = ?
+          AND COALESCE(entity_type, '') = COALESCE(?, '')
+          AND COALESCE(entity_id, -1) = COALESCE(?, -1)
+          AND used_by_telegram_id IS NULL
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (role, normalized_username, entity_type, entity_id),
+    )
+    existing = cur.fetchone()
+    if existing and existing[0]:
+        conn.close()
+        return str(existing[0])
+
+    cur.execute(
+        """
+        INSERT INTO onboarding_invites (
+            token, role, full_name, telegram_username, entity_type, entity_id, created_by, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            token,
+            role,
+            full_name,
+            normalized_username,
+            entity_type,
+            entity_id,
+            created_by,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+
+def get_latest_pending_invite_by_role_and_username(role: str, telegram_username: str | None):
+    normalized_username = normalize_telegram_username(telegram_username)
+    if not normalized_username:
+        return None
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, token, role, full_name, telegram_username, entity_type, entity_id
+        FROM onboarding_invites
+        WHERE role = ?
+          AND telegram_username = ?
+          AND used_by_telegram_id IS NULL
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (role, normalized_username),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_onboarding_invite_by_token(token: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, token, role, full_name, telegram_username, entity_type, entity_id, used_by_telegram_id
+        FROM onboarding_invites
+        WHERE token = ?
+        LIMIT 1
+        """,
+        (token,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def mark_onboarding_invite_used(invite_id: int, telegram_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE onboarding_invites
+        SET used_by_telegram_id = ?,
+            used_at = ?
+        WHERE id = ?
+        """,
+        (telegram_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), invite_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def bind_student_telegram_by_id(
+    student_id: int,
+    telegram_id: int,
+    telegram_username: str | None = None,
+) -> bool:
+    normalized_username = normalize_telegram_username(telegram_username)
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE students
+        SET telegram_id = ?,
+            telegram_username = COALESCE(?, telegram_username)
+        WHERE id = ?
+        """,
+        (telegram_id, normalized_username, student_id),
+    )
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def get_latest_student_by_username(telegram_username: str | None):
+    normalized_username = normalize_telegram_username(telegram_username)
+    if not normalized_username:
+        return None
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, full_name, telegram_id, phone
+        FROM students
+        WHERE telegram_username = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (normalized_username,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def _cleanup_teacher_profiles_for_non_teacher_users(cur):
+    cur.execute(
+        """
+        SELECT telegram_id, full_name
+        FROM users
+        WHERE role <> 'teacher'
+          AND telegram_id IS NOT NULL
+        """
+    )
+    rows = cur.fetchall()
+    for row in rows:
+        if not row or row[0] is None:
+            continue
+        _delete_teacher_entities_for_user(cur, int(row[0]), row[1] if len(row) > 1 else None)
+
+
+def _delete_teacher_entities_for_user(cur, telegram_id: int, full_name: str | None):
+    teacher_ids: set[int] = set()
+
+    cur.execute(
+        """
+        SELECT id
+        FROM teachers
+        WHERE telegram_id = ?
+        """,
+        (telegram_id,),
+    )
+    teacher_ids.update(int(row[0]) for row in cur.fetchall() if row and row[0] is not None)
+
+    if full_name:
+        cur.execute(
+            """
+            SELECT id
+            FROM teachers
+            WHERE full_name = ?
+              AND (telegram_id IS NULL OR telegram_id = ?)
+            """,
+            (full_name, telegram_id),
+        )
+        teacher_ids.update(int(row[0]) for row in cur.fetchall() if row and row[0] is not None)
+
+    for teacher_id in teacher_ids:
+        cur.execute("DELETE FROM teacher_subjects WHERE teacher_id = ?", (teacher_id,))
+        cur.execute("SELECT id FROM student_lessons WHERE teacher_id = ?", (teacher_id,))
+        lesson_ids = [int(row[0]) for row in cur.fetchall() if row and row[0] is not None]
+
+        for lesson_id in lesson_ids:
+            cur.execute("DELETE FROM attendance WHERE student_lesson_id = ?", (lesson_id,))
+            cur.execute("DELETE FROM balance_history WHERE student_lesson_id = ?", (lesson_id,))
+
+        cur.execute("DELETE FROM student_lessons WHERE teacher_id = ?", (teacher_id,))
+        cur.execute("DELETE FROM teachers WHERE id = ?", (teacher_id,))
+
+
+def update_user_role(telegram_id: int, role: str) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT full_name, role
+        FROM users
+        WHERE telegram_id = ?
+        LIMIT 1
+        """,
+        (telegram_id,),
+    )
+    existing_user = cur.fetchone()
+    previous_full_name = existing_user[0] if existing_user else None
+    previous_role = existing_user[1] if existing_user else None
+
+    if role == "teacher":
+        cur.execute(
+            """
+            UPDATE students
+            SET telegram_id = NULL
+            WHERE telegram_id = ?
+            """,
+            (telegram_id,),
+        )
+    elif role == "student":
+        cur.execute(
+            """
+            UPDATE teachers
+            SET telegram_id = NULL
+            WHERE telegram_id = ?
+            """,
+            (telegram_id,),
+        )
+    elif previous_role == "teacher":
+        _delete_teacher_entities_for_user(cur, telegram_id, previous_full_name)
+
+    cur.execute(
+        """
+        UPDATE users
+        SET role = ?, is_active = 1
+        WHERE telegram_id = ?
+        """,
+        (role, telegram_id),
+    )
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def set_user_active(telegram_id: int, is_active: bool) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE users
+        SET is_active = ?
+        WHERE telegram_id = ?
+        """,
+        (1 if is_active else 0, telegram_id),
+    )
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def resolve_student_teacher_telegram_conflicts() -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+
+    cur.execute(
+        """
+        SELECT DISTINCT s.telegram_id
+        FROM students s
+        JOIN teachers t ON t.telegram_id = s.telegram_id
+        WHERE s.telegram_id IS NOT NULL
+        """
+    )
+    conflicted_ids = [int(row[0]) for row in cur.fetchall() if row and row[0] is not None]
+
+    detached_from_students = 0
+    detached_from_teachers = 0
+
+    for telegram_id in conflicted_ids:
+        cur.execute(
+            """
+            SELECT role
+            FROM users
+            WHERE telegram_id = ?
+            LIMIT 1
+            """,
+            (telegram_id,),
+        )
+        user_row = cur.fetchone()
+        preferred_role = user_row[0] if user_row else "teacher"
+
+        if preferred_role == "student":
+            cur.execute(
+                """
+                UPDATE teachers
+                SET telegram_id = NULL
+                WHERE telegram_id = ?
+                """,
+                (telegram_id,),
+            )
+            detached_from_teachers += cur.rowcount
+        else:
+            cur.execute(
+                """
+                UPDATE students
+                SET telegram_id = NULL
+                WHERE telegram_id = ?
+                """,
+                (telegram_id,),
+            )
+            detached_from_students += cur.rowcount
+
+    conn.commit()
+    conn.close()
+    return {
+        "conflicted_telegram_ids": len(conflicted_ids),
+        "detached_from_students": detached_from_students,
+        "detached_from_teachers": detached_from_teachers,
+    }
+
+
+def delete_admin_by_telegram_id(telegram_id: int) -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+
+    cur.execute(
+        """
+        DELETE FROM users
+        WHERE telegram_id = ? AND role = 'admin'
+        """,
+        (telegram_id,),
+    )
+    deleted_users = cur.rowcount
+
+    conn.commit()
+    conn.close()
+    return {
+        "ok": deleted_users > 0,
+        "deleted_users": deleted_users,
+    }
+
+
+def delete_teacher_by_telegram_id(telegram_id: int) -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+
+    cur.execute(
+        """
+        SELECT full_name
+        FROM users
+        WHERE telegram_id = ? AND role = 'teacher'
+        LIMIT 1
+        """,
+        (telegram_id,),
+    )
+    user_row = cur.fetchone()
+    teacher_full_name = user_row[0] if user_row else None
+
+    cur.execute(
+        """
+        SELECT id
+        FROM teachers
+        WHERE telegram_id = ?
+        """,
+        (telegram_id,),
+    )
+    teacher_ids = {row[0] for row in cur.fetchall()}
+
+    if teacher_full_name:
+        cur.execute(
+            """
+            SELECT id
+            FROM teachers
+            WHERE full_name = ?
+            """,
+            (teacher_full_name,),
+        )
+        teacher_ids.update(row[0] for row in cur.fetchall())
+
+    deleted_lessons = 0
+    deleted_attendance = 0
+    deleted_balance_history = 0
+    deleted_teachers = 0
+
+    for teacher_id in teacher_ids:
+        cur.execute("DELETE FROM teacher_subjects WHERE teacher_id = ?", (teacher_id,))
+        cur.execute("SELECT id FROM student_lessons WHERE teacher_id = ?", (teacher_id,))
+        lesson_ids = [row[0] for row in cur.fetchall()]
+
+        for lesson_id in lesson_ids:
+            cur.execute("DELETE FROM attendance WHERE student_lesson_id = ?", (lesson_id,))
+            deleted_attendance += cur.rowcount
+            cur.execute("DELETE FROM balance_history WHERE student_lesson_id = ?", (lesson_id,))
+            deleted_balance_history += cur.rowcount
+
+        cur.execute("DELETE FROM student_lessons WHERE teacher_id = ?", (teacher_id,))
+        deleted_lessons += cur.rowcount
+
+        cur.execute("DELETE FROM teachers WHERE id = ?", (teacher_id,))
+        deleted_teachers += cur.rowcount
+
+    cur.execute(
+        """
+        DELETE FROM users
+        WHERE telegram_id = ? AND role = 'teacher'
+        """,
+        (telegram_id,),
+    )
+    deleted_users = cur.rowcount
+
+    conn.commit()
+    conn.close()
+    return {
+        "ok": deleted_users > 0 or deleted_teachers > 0,
+        "deleted_users": deleted_users,
+        "deleted_teachers": deleted_teachers,
+        "deleted_lessons": deleted_lessons,
+        "deleted_attendance": deleted_attendance,
+        "deleted_balance_history": deleted_balance_history,
+    }
+
+
+def delete_student_by_telegram_id(telegram_id: int) -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+
+    cur.execute(
+        """
+        SELECT id
+        FROM students
+        WHERE telegram_id = ?
+        """,
+        (telegram_id,),
+    )
+    student_ids = [row[0] for row in cur.fetchall()]
+
+    deleted_lessons = 0
+    deleted_attendance = 0
+    deleted_balance_history = 0
+
+    for student_id in student_ids:
+        cur.execute("SELECT id FROM student_lessons WHERE student_id = ?", (student_id,))
+        lesson_ids = [row[0] for row in cur.fetchall()]
+
+        for lesson_id in lesson_ids:
+            cur.execute("DELETE FROM attendance WHERE student_lesson_id = ?", (lesson_id,))
+            deleted_attendance += cur.rowcount
+            cur.execute("DELETE FROM balance_history WHERE student_lesson_id = ?", (lesson_id,))
+            deleted_balance_history += cur.rowcount
+
+        cur.execute("DELETE FROM student_lessons WHERE student_id = ?", (student_id,))
+        deleted_lessons += cur.rowcount
+
+    cur.execute(
+        """
+        DELETE FROM payment_requests
+        WHERE telegram_user_id = ?
+        """,
+        (telegram_id,),
+    )
+    deleted_payment_requests = cur.rowcount
+
+    cur.execute(
+        """
+        DELETE FROM students
+        WHERE telegram_id = ?
+        """,
+        (telegram_id,),
+    )
+    deleted_students = cur.rowcount
+
+    cur.execute(
+        """
+        DELETE FROM users
+        WHERE telegram_id = ? AND role = 'student'
+        """,
+        (telegram_id,),
+    )
+    deleted_users = cur.rowcount
+
+    conn.commit()
+    conn.close()
+    return {
+        "ok": deleted_users > 0 or deleted_students > 0,
+        "deleted_users": deleted_users,
+        "deleted_students": deleted_students,
+        "deleted_lessons": deleted_lessons,
+        "deleted_attendance": deleted_attendance,
+        "deleted_balance_history": deleted_balance_history,
+        "deleted_payment_requests": deleted_payment_requests,
+    }
+
+
+def get_teacher_by_id(teacher_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, telegram_id, full_name
+        FROM teachers
+        WHERE id = ?
+        """,
+        (teacher_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def search_teacher_profiles(query: str, limit: int = 30):
+    conn = get_connection()
+    cur = conn.cursor()
+    normalized_query = " ".join(query.strip().lower().lstrip("@").split())
+
+    def _run_search(search_text: str):
+        pattern = f"%{search_text}%"
+        spaced_pattern = f"%{'%'.join(search_text.split())}%"
+        cur.execute(
+            """
+            SELECT
+                t.id,
+                t.full_name,
+                t.subject_name,
+                u.telegram_username
+            FROM teachers t
+            LEFT JOIN users u
+                ON u.telegram_id = t.telegram_id
+               AND u.role = 'teacher'
+            WHERE LOWER(t.full_name) LIKE ?
+               OR LOWER(t.full_name) LIKE ?
+               OR LOWER(COALESCE(t.subject_name, '')) LIKE ?
+               OR EXISTS (
+                    SELECT 1
+                    FROM teacher_subjects ts
+                    WHERE ts.teacher_id = t.id
+                      AND LOWER(ts.subject_name) LIKE ?
+               )
+               OR LOWER(COALESCE(u.telegram_username, '')) LIKE ?
+            ORDER BY
+                CASE
+                    WHEN LOWER(t.full_name) = ? THEN 0
+                    WHEN LOWER(t.full_name) LIKE ? THEN 1
+                    ELSE 2
+                END,
+                t.full_name
+            LIMIT ?
+            """,
+            (
+                pattern,
+                spaced_pattern,
+                pattern,
+                pattern,
+                pattern,
+                search_text,
+                f"{search_text}%",
+                limit,
+            ),
+        )
+        return cur.fetchall()
+
+    rows = _run_search(normalized_query) if normalized_query else []
+    if not rows and len(normalized_query) >= 2:
+        rows = _run_search(normalized_query[:2])
+
+    conn.close()
+    return rows
+
+
+def list_teacher_profiles(limit: int = 500):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            t.id,
+            t.full_name,
+            t.subject_name,
+            u.telegram_username
+        FROM teachers t
+        LEFT JOIN users u
+            ON u.telegram_id = t.telegram_id
+           AND u.role = 'teacher'
+        ORDER BY t.full_name
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_teacher_profile_by_id(teacher_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            t.id,
+            t.telegram_id,
+            t.full_name,
+            t.subject_name,
+            t.description,
+            t.photo_path,
+            u.telegram_username
+        FROM teachers t
+        LEFT JOIN users u
+            ON u.telegram_id = t.telegram_id
+           AND u.role = 'teacher'
+        WHERE t.id = ?
+        """,
+        (teacher_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def update_teacher_profile_fields(
+    teacher_id: int,
+    *,
+    full_name: str,
+    subject_name: str,
+    description: str | None,
+    photo_path: str | None,
+):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE teachers
+        SET full_name = ?,
+            subject_name = ?,
+            description = ?,
+            photo_path = ?
+        WHERE id = ?
+        """,
+        (full_name, subject_name, description, photo_path, teacher_id),
+    )
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    replace_teacher_subject_links(teacher_id, subject_name)
+    return changed
+
+
+def set_teacher_telegram_id(teacher_id: int, telegram_id: int | None):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE teachers
+        SET telegram_id = ?
+        WHERE id = ?
+        """,
+        (telegram_id, teacher_id),
+    )
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
 
 
 def log_admin_action(
@@ -1055,6 +2714,31 @@ def get_users_by_role(role: str):
     return rows
 
 
+def get_active_student_telegram_ids() -> list[int]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT telegram_id
+        FROM (
+            SELECT telegram_id
+            FROM users
+            WHERE role = 'student'
+              AND is_active = 1
+              AND telegram_id IS NOT NULL
+            UNION
+            SELECT telegram_id
+            FROM students
+            WHERE telegram_id IS NOT NULL
+        )
+        ORDER BY telegram_id
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [int(row[0]) for row in rows if row and row[0] is not None]
+
+
 def get_student_by_telegram_id(telegram_id: int):
     conn = get_connection()
     cur = conn.cursor()
@@ -1073,3 +2757,543 @@ def get_student_by_telegram_id(telegram_id: int):
 
     conn.close()
     return row
+
+
+def create_publication_post(
+    *,
+    created_by: int,
+    audience: str = "students",
+    description: str,
+    photo_file_id: str | None = None,
+    links: list[str] | None = None,
+    scheduled_for: str,
+) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    links_json = json.dumps(links or [], ensure_ascii=False)
+    cur.execute(
+        """
+        INSERT INTO publication_posts (
+            created_by,
+            audience,
+            description,
+            photo_file_id,
+            links_json,
+            status,
+            scheduled_for,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, 'scheduled', ?, ?, ?)
+        """,
+        (
+            created_by,
+            audience,
+            description.strip(),
+            photo_file_id,
+            links_json,
+            scheduled_for,
+            now,
+            now,
+        ),
+    )
+    post_id = int(cur.lastrowid) if cur.lastrowid is not None else 0
+    conn.commit()
+    conn.close()
+    return post_id
+
+
+def get_due_publication_posts(limit: int = 20):
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        """
+        SELECT
+            id,
+            created_by,
+            audience,
+            description,
+            photo_file_id,
+            links_json,
+            status,
+            scheduled_for,
+            sent_at,
+            created_at,
+            updated_at,
+            last_error
+        FROM publication_posts
+        WHERE status = 'scheduled'
+          AND scheduled_for <= ?
+        ORDER BY scheduled_for, id
+        LIMIT ?
+        """,
+        (now, limit),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def mark_publication_post_sent(post_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        """
+        UPDATE publication_posts
+        SET status = 'sent',
+            sent_at = ?,
+            updated_at = ?,
+            last_error = NULL
+        WHERE id = ?
+        """,
+        (now, now, post_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def mark_publication_post_failed(post_id: int, error_text: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        """
+        UPDATE publication_posts
+        SET status = 'failed',
+            updated_at = ?,
+            last_error = ?
+        WHERE id = ?
+        """,
+        (now, error_text[:500], post_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_debt_rows_for_reminder(reminder_date: str):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT
+            sl.id,
+            s.telegram_id,
+            s.full_name,
+            t.full_name,
+            sl.subject_name,
+            sl.lesson_balance
+        FROM student_lessons sl
+        JOIN students s ON s.id = sl.student_id
+        JOIN teachers t ON t.id = sl.teacher_id
+        WHERE sl.lesson_balance < 0
+          AND s.telegram_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM debt_reminder_log dr
+              WHERE dr.student_lesson_id = sl.id
+                AND dr.reminder_date = ?
+          )
+        ORDER BY s.id, sl.id
+        """,
+        (reminder_date,),
+    )
+    rows = cur.fetchall()
+
+    conn.close()
+    return rows
+
+
+def search_users_by_name_or_username(
+    query: str,
+    roles: list[str] | tuple[str, ...] | None = None,
+    limit: int = 30,
+):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    normalized_query = query.strip().lower().lstrip("@")
+    pattern = f"%{normalized_query}%"
+    if roles:
+        placeholders = ",".join("?" for _ in roles)
+        cur.execute(
+            f"""
+            SELECT id, telegram_id, full_name, role, is_active, telegram_username
+            FROM users
+            WHERE role IN ({placeholders})
+              AND (
+                LOWER(full_name) LIKE ?
+                OR LOWER(COALESCE(telegram_username, '')) LIKE ?
+              )
+            ORDER BY full_name
+            LIMIT ?
+            """,
+            (*roles, pattern, pattern, limit),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, telegram_id, full_name, role, is_active, telegram_username
+            FROM users
+            WHERE LOWER(full_name) LIKE ?
+               OR LOWER(COALESCE(telegram_username, '')) LIKE ?
+            ORDER BY full_name
+            LIMIT ?
+            """,
+            (pattern, pattern, limit),
+        )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_user_by_id(user_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, telegram_id, full_name, role, is_active, telegram_username
+        FROM users
+        WHERE id = ?
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def mark_debt_reminder_sent(student_lesson_id: int, reminder_date: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO debt_reminder_log (
+            student_lesson_id, reminder_date, reminded_at
+        )
+        VALUES (?, ?, ?)
+        """,
+        (
+            student_lesson_id,
+            reminder_date,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_active_admin_telegram_ids() -> list[int]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT telegram_id
+        FROM users
+        WHERE role IN ('admin', 'superadmin')
+          AND is_active = 1
+        ORDER BY telegram_id
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [int(row[0]) for row in rows if row and row[0] is not None]
+
+
+def get_active_admin_contacts() -> list[tuple[int, str, str | None]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT telegram_id, full_name, telegram_username
+        FROM users
+        WHERE role IN ('admin', 'superadmin')
+          AND is_active = 1
+          AND telegram_id IS NOT NULL
+        ORDER BY role DESC, full_name
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        (
+            int(row[0]),
+            escape((row[1] or "").strip()) or f"ID {int(row[0])}",
+            normalize_telegram_username(row[2]),
+        )
+        for row in rows
+        if row and row[0] is not None
+    ]
+
+
+def get_teacher_catalog_subjects() -> list[str]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT subject_name
+        FROM (
+            SELECT subject_name
+            FROM teachers
+            WHERE subject_name IS NOT NULL
+              AND TRIM(subject_name) <> ''
+            UNION
+            SELECT subject_name
+            FROM teacher_subjects
+            WHERE subject_name IS NOT NULL
+              AND TRIM(subject_name) <> ''
+        )
+        ORDER BY subject_name
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+def get_teacher_catalog_names() -> list[str]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT DISTINCT full_name
+        FROM teachers
+        WHERE full_name IS NOT NULL
+          AND TRIM(full_name) <> ''
+        ORDER BY full_name
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+def get_teacher_cards_by_subject(subject_name: str) -> list[dict]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT DISTINCT t.id, t.full_name, t.description, t.photo_path, t.telegram_id
+        FROM teachers t
+        WHERE t.subject_name = ?
+        ORDER BY t.id
+        """,
+        (subject_name,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    result = []
+    for row in rows:
+        result.append(
+            {
+                "id": int(row[0]),
+                "name": row[1],
+                "description": row[2] or "",
+                "photo": row[3],
+                "telegram_id": row[4],
+            }
+        )
+    return result
+
+
+def save_daily_debt_snapshot(snapshot_date: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO debt_daily_snapshots (
+            snapshot_date, student_lesson_id, lesson_balance
+        )
+        SELECT ?, id, lesson_balance
+        FROM student_lessons
+        """,
+        (snapshot_date,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _get_snapshot_map(snapshot_date: str) -> dict[int, int]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT student_lesson_id, lesson_balance
+        FROM debt_daily_snapshots
+        WHERE snapshot_date = ?
+        """,
+        (snapshot_date,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return {int(row[0]): int(row[1]) for row in rows}
+
+
+def _get_latest_snapshot_date_before(snapshot_date: str) -> str | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT MAX(snapshot_date)
+        FROM debt_daily_snapshots
+        WHERE snapshot_date < ?
+        """,
+        (snapshot_date,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+
+def _get_lesson_details_map(lesson_ids: list[int]) -> dict[int, dict]:
+    if not lesson_ids:
+        return {}
+
+    conn = get_connection()
+    cur = conn.cursor()
+    placeholders = ",".join("?" for _ in lesson_ids)
+    cur.execute(
+        f"""
+        SELECT
+            sl.id,
+            s.telegram_id,
+            s.full_name,
+            t.full_name,
+            sl.subject_name,
+            sl.lesson_balance
+        FROM student_lessons sl
+        JOIN students s ON s.id = sl.student_id
+        JOIN teachers t ON t.id = sl.teacher_id
+        WHERE sl.id IN ({placeholders})
+        """,
+        lesson_ids,
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    result = {}
+    for row in rows:
+        lesson_id, telegram_id, student_name, teacher_name, subject_name, lesson_balance = row
+        result[int(lesson_id)] = {
+            "lesson_id": int(lesson_id),
+            "telegram_id": int(telegram_id) if telegram_id is not None else None,
+            "student_name": student_name,
+            "teacher_name": teacher_name,
+            "subject_name": subject_name,
+            "lesson_balance": int(lesson_balance),
+        }
+    return result
+
+
+def _calculate_debt_age_days(student_lesson_id: int, report_date: str) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT snapshot_date, lesson_balance
+        FROM debt_daily_snapshots
+        WHERE student_lesson_id = ?
+          AND snapshot_date <= ?
+        ORDER BY snapshot_date DESC
+        """,
+        (student_lesson_id, report_date),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    streak_start: str | None = None
+    for snapshot_day, balance in rows:
+        if balance < 0:
+            streak_start = snapshot_day
+            continue
+        break
+
+    if not streak_start:
+        return 0
+
+    start_dt = datetime.strptime(streak_start, "%Y-%m-%d").date()
+    end_dt = datetime.strptime(report_date, "%Y-%m-%d").date()
+    return (end_dt - start_dt).days + 1
+
+
+def build_daily_debt_report(report_date: str, overdue_days: int = 7) -> dict:
+    save_daily_debt_snapshot(report_date)
+
+    today_map = _get_snapshot_map(report_date)
+    prev_date = _get_latest_snapshot_date_before(report_date)
+    prev_map = _get_snapshot_map(prev_date) if prev_date else {}
+
+    today_negative_ids = {lesson_id for lesson_id, bal in today_map.items() if bal < 0}
+    prev_negative_ids = {lesson_id for lesson_id, bal in prev_map.items() if bal < 0}
+
+    new_debt_ids = sorted(today_negative_ids - prev_negative_ids)
+    closed_debt_ids = sorted(prev_negative_ids - today_negative_ids)
+    overdue_ids = []
+    for lesson_id in sorted(today_negative_ids):
+        age_days = _calculate_debt_age_days(lesson_id, report_date)
+        if age_days > overdue_days:
+            overdue_ids.append((lesson_id, age_days))
+
+    details_map = _get_lesson_details_map(
+        sorted(set(new_debt_ids + closed_debt_ids + [lesson_id for lesson_id, _ in overdue_ids]))
+    )
+
+    new_debts = []
+    for lesson_id in new_debt_ids:
+        item = details_map.get(lesson_id, {"lesson_id": lesson_id})
+        new_debts.append(item)
+
+    closed_debts = []
+    for lesson_id in closed_debt_ids:
+        item = details_map.get(lesson_id, {"lesson_id": lesson_id})
+        closed_debts.append(item)
+
+    overdue_debts = []
+    for lesson_id, age_days in overdue_ids:
+        item = details_map.get(lesson_id, {"lesson_id": lesson_id})
+        item = {**item, "age_days": age_days}
+        overdue_debts.append(item)
+
+    return {
+        "report_date": report_date,
+        "previous_snapshot_date": prev_date,
+        "total_current_debts": len(today_negative_ids),
+        "new_debts": new_debts,
+        "closed_debts": closed_debts,
+        "overdue_debts": overdue_debts,
+    }
+
+
+def is_daily_debt_report_sent(report_date: str) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1
+        FROM debt_report_runs
+        WHERE report_date = ?
+        """,
+        (report_date,),
+    )
+    exists = cur.fetchone() is not None
+    conn.close()
+    return exists
+
+
+def mark_daily_debt_report_sent(report_date: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO debt_report_runs (
+            report_date, sent_at
+        )
+        VALUES (?, ?)
+        """,
+        (report_date, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+    conn.close()

@@ -2,11 +2,10 @@ from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-import importlib.util
 import logging
 import os
 import re
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -31,6 +30,8 @@ from keyboards import (
     get_user_selection_keyboard,
     get_teacher_selection_keyboard,
     get_teacher_subject_picker_keyboard,
+    get_publication_audience_keyboard,
+    get_publication_schedule_keyboard,
 )
 from states import AdminStates
 from shared.database import (
@@ -60,6 +61,7 @@ from shared.database import (
     get_teacher_by_telegram_id,
     get_teacher_by_id,
     search_teacher_profiles,
+    list_teacher_profiles,
     get_teacher_profile_by_id,
     get_teacher_catalog_subjects,
     update_teacher_profile_fields,
@@ -77,6 +79,7 @@ from shared.database import (
     get_latest_pending_invite_by_role_and_username,
     mark_onboarding_invite_used,
     upsert_known_telegram_user,
+    create_publication_post,
 )
 
 router = Router()
@@ -517,27 +520,10 @@ def can_manage_attendance(user_id: int, direction_id: int) -> bool:
 
 
 def load_teacher_names_for_binding() -> list[str]:
-    data_path = Path(__file__).resolve().parent.parent / "school-bot" / "data.py"
-    if not data_path.exists():
-        return []
-
-    try:
-        spec = importlib.util.spec_from_file_location("school_bot_data", data_path)
-        if spec is None or spec.loader is None:
-            return []
-
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        teachers_data = getattr(module, "TEACHERS_DATA", {})
-    except Exception:
-        return []
-
     names: list[str] = []
-    for subject_teachers in teachers_data.values():
-        for teacher in subject_teachers:
-            name = teacher.get("name")
-            if name and name not in names:
-                names.append(name)
+    for _teacher_id, full_name, _subject_name, _username in list_teacher_profiles(limit=2000):
+        if full_name and full_name not in names:
+            names.append(full_name)
 
     return names
 
@@ -550,6 +536,34 @@ def build_onboarding_link(token: str) -> str | None:
     if not SCHOOL_BOT_USERNAME:
         return None
     return f"https://t.me/{SCHOOL_BOT_USERNAME}?start=invite_{token}"
+
+
+def parse_publication_links(raw_text: str) -> list[str]:
+    value = (raw_text or "").strip()
+    if not value or value == "-":
+        return []
+
+    links: list[str] = []
+    for token in re.split(r"[\s,;]+", value):
+        token = token.strip()
+        if not token:
+            continue
+        if token.startswith("@"):
+            token = f"https://t.me/{token.lstrip('@')}"
+        if token.startswith("http://") or token.startswith("https://"):
+            if token not in links:
+                links.append(token)
+    return links[:8]
+
+
+def parse_publication_schedule(value: str) -> datetime | None:
+    text = value.strip()
+    for fmt in ("%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 @router.message(CommandStart())
@@ -683,6 +697,222 @@ async def superadmin_back_main(callback: CallbackQuery):
         return
     await callback.message.answer("Главное меню супер-администратора.", reply_markup=get_superadmin_menu())
     await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "admin_publication_new")
+async def admin_publication_new(callback: CallbackQuery, state: FSMContext):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await state.clear()
+    await callback.message.answer(
+        "Введите текст публикации для учеников.\n"
+        "Описание обязательно.",
+        reply_markup=get_main_menu_shortcut_keyboard(),
+    )
+    await state.set_state(AdminStates.waiting_publication_description)
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_publication_description)
+async def admin_publication_description(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if len(text) < 3:
+        await message.answer("Описание слишком короткое. Введите полноценный текст публикации.")
+        return
+
+    await state.update_data(publication_description=text)
+    await message.answer(
+        "Теперь отправьте фото для публикации.\n"
+        "Если фото не нужно, отправьте символ: -"
+    )
+    await state.set_state(AdminStates.waiting_publication_photo)
+
+
+@router.message(AdminStates.waiting_publication_photo)
+async def admin_publication_photo(message: Message, state: FSMContext):
+    photo_file_id = None
+    text_value = (message.text or "").strip()
+
+    if message.photo:
+        photo_file_id = message.photo[-1].file_id
+    elif text_value != "-":
+        await message.answer("Отправьте фото или символ - чтобы пропустить.")
+        return
+
+    await state.update_data(publication_photo_file_id=photo_file_id)
+    await message.answer(
+        "Добавьте ссылки (через пробел или с новой строки).\n"
+        "Можно вставлять URL или @username.\n"
+        "Если ссылки не нужны, отправьте: -"
+    )
+    await state.set_state(AdminStates.waiting_publication_links)
+
+
+@router.message(AdminStates.waiting_publication_links)
+async def admin_publication_links(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    links = parse_publication_links(raw)
+    if raw and raw != "-" and not links:
+        await message.answer(
+            "Не удалось распознать ссылки.\n"
+            "Используйте формат https://... или @username, либо отправьте -."
+        )
+        return
+
+    await state.update_data(publication_links=links)
+    await message.answer(
+        "Выберите аудиторию публикации:",
+        reply_markup=get_publication_audience_keyboard(),
+    )
+    await state.set_state(AdminStates.waiting_publication_audience)
+
+
+@router.callback_query(
+    AdminStates.waiting_publication_audience,
+    lambda c: c.data in {
+        "publication_audience_students",
+        "publication_audience_students_plus_me",
+        "publication_audience_me_only",
+    },
+)
+async def admin_publication_audience(callback: CallbackQuery, state: FSMContext):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    audience_map = {
+        "publication_audience_students": "students",
+        "publication_audience_students_plus_me": "students_plus_creator",
+        "publication_audience_me_only": "creator_only",
+    }
+    audience = audience_map.get(callback.data, "students")
+    await state.update_data(publication_audience=audience)
+    await callback.message.answer(
+        "Выберите, когда отправить публикацию:",
+        reply_markup=get_publication_schedule_keyboard(),
+    )
+    await state.set_state(AdminStates.waiting_publication_schedule_mode)
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminStates.waiting_publication_schedule_mode,
+    lambda c: c.data in {"publication_send_now", "publication_schedule_pick_time"},
+)
+async def admin_publication_schedule_mode(callback: CallbackQuery, state: FSMContext):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    data = await state.get_data()
+    description = (data.get("publication_description") or "").strip()
+    photo_file_id = data.get("publication_photo_file_id")
+    links = data.get("publication_links") or []
+    audience = data.get("publication_audience") or "students"
+
+    if not description:
+        await state.clear()
+        await callback.message.answer("Сценарий публикации сброшен. Начните заново.")
+        await callback.answer()
+        return
+
+    if callback.data == "publication_send_now":
+        scheduled_for = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        post_id = create_publication_post(
+            created_by=callback.from_user.id,
+            audience=audience,
+            description=description,
+            photo_file_id=photo_file_id,
+            links=links,
+            scheduled_for=scheduled_for,
+        )
+        log_admin_action(
+            admin_telegram_id=callback.from_user.id,
+            action_type="publication_created",
+            target_type="publication_post",
+            target_id=post_id,
+            details={
+                "mode": "now",
+                "audience": audience,
+                "has_photo": bool(photo_file_id),
+                "links_count": len(links),
+            },
+            status="success",
+        )
+        await state.clear()
+        await callback.message.answer(
+            f"Публикация создана и поставлена в очередь отправки (ID: {post_id}).",
+            reply_markup=get_admin_reply_menu(callback.from_user.id),
+        )
+        await callback.answer("Готово")
+        return
+
+    await callback.message.answer(
+        "Введите дату и время публикации.\n"
+        "Формат: ДД.ММ.ГГГГ ЧЧ:ММ\n"
+        "Например: 25.04.2026 10:30"
+    )
+    await state.set_state(AdminStates.waiting_publication_schedule_datetime)
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_publication_schedule_datetime)
+async def admin_publication_schedule_datetime(message: Message, state: FSMContext):
+    if not is_admin_role(message.from_user.id):
+        await message.answer("Нет доступа.")
+        await state.clear()
+        return
+
+    schedule_dt = parse_publication_schedule(message.text or "")
+    if schedule_dt is None:
+        await message.answer("Неверный формат даты. Пример: 25.04.2026 10:30")
+        return
+    if schedule_dt <= datetime.now():
+        await message.answer("Дата должна быть в будущем. Укажите более позднее время.")
+        return
+
+    data = await state.get_data()
+    description = (data.get("publication_description") or "").strip()
+    if not description:
+        await state.clear()
+        await message.answer("Сценарий публикации сброшен. Начните заново.")
+        return
+
+    photo_file_id = data.get("publication_photo_file_id")
+    links = data.get("publication_links") or []
+    audience = data.get("publication_audience") or "students"
+    scheduled_for = schedule_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    post_id = create_publication_post(
+        created_by=message.from_user.id,
+        audience=audience,
+        description=description,
+        photo_file_id=photo_file_id,
+        links=links,
+        scheduled_for=scheduled_for,
+    )
+    log_admin_action(
+        admin_telegram_id=message.from_user.id,
+        action_type="publication_created",
+        target_type="publication_post",
+        target_id=post_id,
+        details={
+            "mode": "scheduled",
+            "audience": audience,
+            "scheduled_for": scheduled_for,
+            "has_photo": bool(photo_file_id),
+            "links_count": len(links),
+        },
+        status="success",
+    )
+
+    await state.clear()
+    await message.answer(
+        f"Публикация запланирована на {schedule_dt.strftime('%d.%m.%Y %H:%M')} (ID: {post_id}).",
+        reply_markup=get_admin_reply_menu(message.from_user.id),
+    )
 
 
 @router.callback_query(lambda c: c.data == "admin_add_student")
@@ -958,10 +1188,10 @@ async def admin_assign_lesson(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    text_lines = ["Выбери ученика по ID и отправь номер сообщением:\n"]
-    for student in students:
+    text_lines = ["Выбери ученика из списка ниже и отправь его ID (в скобках):\n"]
+    for index, student in enumerate(students, start=1):
         student_id, full_name, telegram_id, phone = student
-        text_lines.append(f"{student_id}. {full_name}")
+        text_lines.append(f"{index}. {full_name} (ID: {student_id})")
 
     await callback.message.answer("\n".join(text_lines))
     await state.set_state(AdminStates.choosing_student_for_lesson)
@@ -989,8 +1219,21 @@ async def choose_student_for_lesson(message: Message, state: FSMContext):
         await message.answer("Ученика с таким ID нет. Введи корректный ID.")
         return
 
-    await state.update_data(student_id=student_id)
-    await message.answer("Введите часть ФИО преподавателя (например: Мария):")
+    teachers = list_teacher_profiles(limit=1000)
+    if not teachers:
+        await message.answer("Преподаватели пока не добавлены.")
+        await state.clear()
+        return
+
+    await state.update_data(
+        student_id=student_id,
+        assign_teacher_candidates=[int(item[0]) for item in teachers],
+    )
+    await message.answer(
+        "Выберите преподавателя из списка кнопками ниже.\n"
+        "Или введите часть ФИО для поиска (например: Ма).",
+        reply_markup=get_teacher_selection_keyboard(teachers, action_prefix="assign_teacher_pick"),
+    )
     await state.set_state(AdminStates.waiting_teacher_name)
     return
 
@@ -1045,21 +1288,45 @@ async def search_teacher_for_lesson_by_fio(message: Message, state: FSMContext):
         await message.answer("По ФИО преподаватели не найдены. Попробуйте другой запрос.")
         return
 
-    if len(teachers) == 1:
-        teacher_id, teacher_name, _subject_name, _username = teachers[0]
-        await state.update_data(teacher_id=int(teacher_id), teacher_name=teacher_name)
-        await message.answer(
-            f"Найден преподаватель: {teacher_name}\n\nВведите часть названия предмета (или новое название):"
-        )
-        await state.set_state(AdminStates.waiting_subject_name)
+    await state.update_data(assign_teacher_candidates=[int(item[0]) for item in teachers])
+    await message.answer(
+        "Найдены преподаватели. Выберите нужного кнопкой:",
+        reply_markup=get_teacher_selection_keyboard(teachers, action_prefix="assign_teacher_pick"),
+    )
+    await state.set_state(AdminStates.waiting_teacher_name)
+
+
+@router.callback_query(lambda c: c.data.startswith("assign_teacher_pick_"))
+async def choose_teacher_for_lesson(callback: CallbackQuery, state: FSMContext):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        await state.clear()
         return
 
-    lines = ["Найдено несколько преподавателей. Уточните ФИО и отправьте ещё раз:\n"]
-    for teacher_id, teacher_name, subject_name, username in teachers[:10]:
-        subject_text = subject_name or "без предмета"
-        username_text = f"@{username}" if username else "без username"
-        lines.append(f"• {teacher_name} ({subject_text}, {username_text}, id={teacher_id})")
-    await message.answer("\n".join(lines))
+    try:
+        teacher_id = int(callback.data.split("_")[-1])
+    except (TypeError, ValueError):
+        await callback.answer("Не удалось определить преподавателя", show_alert=True)
+        return
+
+    data = await state.get_data()
+    allowed_ids = data.get("assign_teacher_candidates") or []
+    if allowed_ids and teacher_id not in allowed_ids:
+        await callback.answer("Преподаватель не из текущего списка", show_alert=True)
+        return
+
+    teacher = get_teacher_profile_by_id(teacher_id)
+    if not teacher:
+        await callback.answer("Преподаватель не найден", show_alert=True)
+        return
+
+    _, _teacher_telegram_id, teacher_name, _teacher_subject, _description, _photo, _username = teacher
+    await state.update_data(teacher_id=teacher_id, teacher_name=teacher_name)
+    await callback.message.answer(
+        f"Выбран преподаватель: {teacher_name}\n\nВведите часть названия предмета (или новое название):"
+    )
+    await state.set_state(AdminStates.waiting_subject_name)
+    await callback.answer()
 
 
 @router.message(AdminStates.waiting_subject_name)
@@ -1380,9 +1647,9 @@ async def attendance_student_search(message: Message, state: FSMContext):
 
     if len(students) > 1:
         lines = ["Найдено несколько учеников:\n"]
-        for student in students:
+        for index, student in enumerate(students, start=1):
             student_id, full_name, telegram_id, phone = student
-            lines.append(f"{student_id}. {full_name}")
+            lines.append(f"{index}. {full_name} (ID: {student_id})")
         lines.append("\nУточни запрос точнее.")
         await message.answer("\n".join(lines), reply_markup=get_admin_menu())
         await state.clear()
@@ -1535,9 +1802,9 @@ async def balance_student_search(message: Message, state: FSMContext):
 
     if len(students) > 1:
         lines = ["Найдено несколько учеников:\n"]
-        for student in students:
+        for index, student in enumerate(students, start=1):
             student_id, full_name, telegram_id, phone = student
-            lines.append(f"{student_id}. {full_name}")
+            lines.append(f"{index}. {full_name} (ID: {student_id})")
         lines.append("\nУточни запрос точнее.")
         await message.answer("\n".join(lines), reply_markup=get_admin_menu())
         await state.clear()
@@ -1704,9 +1971,9 @@ async def show_balance_history(message: Message, state: FSMContext):
 
     if len(students) > 1:
         lines = ["Найдено несколько учеников:\n"]
-        for student in students:
+        for index, student in enumerate(students, start=1):
             student_id, full_name, telegram_id, phone = student
-            lines.append(f"{student_id}. {full_name}")
+            lines.append(f"{index}. {full_name} (ID: {student_id})")
         lines.append("\nУточни запрос точнее.")
         await message.answer("\n".join(lines), reply_markup=get_admin_menu())
         await state.clear()
@@ -2772,8 +3039,12 @@ async def student_profile(callback: CallbackQuery):
     admin_links_text = ""
     if admin_contacts:
         admin_links = [
-            f"• <a href=\"tg://user?id={telegram_id}\">{full_name}</a>"
-            for telegram_id, full_name in admin_contacts
+            (
+                f"• <a href=\"https://t.me/{username}\">{full_name}</a>"
+                if username
+                else f"• <a href=\"tg://user?id={telegram_id}\">{full_name}</a>"
+            )
+            for telegram_id, full_name, username in admin_contacts
         ]
         admin_links_text = "\n\n<b>Напишите администратору:</b>\n" + "\n".join(admin_links)
 

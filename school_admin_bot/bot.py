@@ -1,7 +1,14 @@
 import asyncio
+import contextlib
+import json
 import logging
+import os
+from io import BytesIO
+from datetime import date, datetime
 
 from aiogram import Bot, Dispatcher
+from aiogram.types import BufferedInputFile
+from aiogram.types import BotCommand, MenuButtonCommands
 import sys
 from pathlib import Path
 
@@ -9,14 +16,250 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR))
 
 from config import BOT_TOKEN
-from config import SUPERADMINS
+from config import SCHOOL_BOT_TOKEN, SUPERADMINS
 from handlers import router
-from shared.database import init_db, run_startup_maintenance_from_env
+from shared.database import (
+    build_daily_debt_report,
+    get_active_admin_telegram_ids,
+    get_active_student_telegram_ids,
+    get_due_publication_posts,
+    init_db,
+    is_daily_debt_report_sent,
+    mark_publication_post_failed,
+    mark_publication_post_sent,
+    mark_daily_debt_report_sent,
+    run_startup_maintenance_from_env,
+)
 from shared.logging_setup import get_log_settings, setup_logging
 
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+
+def _format_debt_report_text(report_data: dict, overdue_days: int) -> str:
+    report_date = report_data.get("report_date", "-")
+    total_current_debts = report_data.get("total_current_debts", 0)
+    new_debts = report_data.get("new_debts", [])
+    closed_debts = report_data.get("closed_debts", [])
+    overdue_debts = report_data.get("overdue_debts", [])
+
+    lines = [
+        f"📊 <b>Ежедневный отчёт по долгам ({report_date})</b>",
+        "",
+        f"Текущих долгов по направлениям: <b>{total_current_debts}</b>",
+        f"Новые долги за день: <b>{len(new_debts)}</b>",
+        f"Закрытые долги за день: <b>{len(closed_debts)}</b>",
+        f"Долги старше {overdue_days} дн.: <b>{len(overdue_debts)}</b>",
+    ]
+
+    if new_debts:
+        lines.append("")
+        lines.append("<b>Новые долги:</b>")
+        for item in new_debts[:20]:
+            lines.append(
+                f"- {item.get('student_name', '—')} | {item.get('subject_name', '—')} — "
+                f"{item.get('teacher_name', '—')} | долг: {abs(item.get('lesson_balance', 0))}"
+            )
+
+    if closed_debts:
+        lines.append("")
+        lines.append("<b>Закрытые долги:</b>")
+        for item in closed_debts[:20]:
+            lines.append(
+                f"- {item.get('student_name', '—')} | {item.get('subject_name', '—')} — "
+                f"{item.get('teacher_name', '—')}"
+            )
+
+    if overdue_debts:
+        lines.append("")
+        lines.append(f"<b>Не оплатили более {overdue_days} дней:</b>")
+        for item in overdue_debts[:30]:
+            lines.append(
+                f"- {item.get('student_name', '—')} | {item.get('subject_name', '—')} — "
+                f"{item.get('teacher_name', '—')} | дней: {item.get('age_days', 0)} | "
+                f"долг: {abs(item.get('lesson_balance', 0))}"
+            )
+
+    return "\n".join(lines)
+
+
+async def debt_report_worker():
+    logger = logging.getLogger(__name__)
+    overdue_days_raw = os.getenv("SCHOOL_DEBT_OVERDUE_DAYS", "7").strip()
+    report_hour_raw = os.getenv("SCHOOL_DEBT_REPORT_HOUR", "10").strip()
+
+    try:
+        overdue_days = max(1, int(overdue_days_raw))
+    except ValueError:
+        overdue_days = 7
+
+    try:
+        report_hour = min(23, max(0, int(report_hour_raw)))
+    except ValueError:
+        report_hour = 10
+
+    while True:
+        try:
+            now = datetime.now()
+            report_date = date.today().isoformat()
+            if now.hour >= report_hour and not is_daily_debt_report_sent(report_date):
+                report_data = build_daily_debt_report(report_date=report_date, overdue_days=overdue_days)
+                text = _format_debt_report_text(report_data, overdue_days)
+
+                recipients = sorted(set(list(SUPERADMINS) + get_active_admin_telegram_ids()))
+                for recipient in recipients:
+                    try:
+                        await bot.send_message(recipient, text, parse_mode="HTML")
+                    except Exception as exc:
+                        logger.warning("Debt report send failed for %s: %s", recipient, exc)
+
+                mark_daily_debt_report_sent(report_date)
+        except Exception as exc:
+            logger.exception("Debt report worker error: %s", exc)
+
+        await asyncio.sleep(3600)
+
+
+def _build_publication_text(description: str, links_json: str | None) -> str:
+    links: list[str] = []
+    if links_json:
+        try:
+            parsed = json.loads(links_json)
+            if isinstance(parsed, list):
+                links = [str(item).strip() for item in parsed if str(item).strip()]
+        except Exception:
+            links = []
+
+    if not links:
+        return description
+
+    lines = [description, "", "Ссылки:"]
+    for link in links:
+        lines.append(f"- {link}")
+    return "\n".join(lines)
+
+
+async def publication_worker():
+    logger = logging.getLogger(__name__)
+    publish_bot: Bot = bot
+    if SCHOOL_BOT_TOKEN:
+        publish_bot = Bot(token=SCHOOL_BOT_TOKEN)
+
+    try:
+        while True:
+            try:
+                due_posts = get_due_publication_posts(limit=20)
+
+                for post in due_posts:
+                    (
+                        post_id,
+                        created_by,
+                        audience,
+                        description,
+                        photo_file_id,
+                        links_json,
+                        _status,
+                        _scheduled_for,
+                        _sent_at,
+                        _created_at,
+                        _updated_at,
+                        _last_error,
+                    ) = post
+
+                    text = _build_publication_text(description, links_json)
+                    recipients = set()
+                    if audience == "creator_only":
+                        recipients.add(int(created_by))
+                    elif audience == "students_plus_creator":
+                        recipients.update(get_active_student_telegram_ids())
+                        recipients.add(int(created_by))
+                    else:
+                        recipients.update(get_active_student_telegram_ids())
+
+                    sent_any = False
+                    failed_count = 0
+                    first_error: str | None = None
+                    photo_bytes: bytes | None = None
+                    photo_send_enabled = bool(photo_file_id)
+
+                    if photo_file_id and publish_bot is not bot:
+                        try:
+                            file_info = await bot.get_file(photo_file_id)
+                            buffer = BytesIO()
+                            await bot.download_file(file_info.file_path, destination=buffer)
+                            photo_bytes = buffer.getvalue()
+                            if not photo_bytes:
+                                photo_send_enabled = False
+                        except Exception as exc:
+                            logger.warning(
+                                "Publication %s: failed to fetch photo for cross-bot send, fallback to text-only: %s",
+                                post_id,
+                                exc,
+                            )
+                            photo_send_enabled = False
+
+                    for telegram_id in sorted(recipients):
+                        try:
+                            if photo_send_enabled and photo_file_id:
+                                caption = text if len(text) <= 1024 else text[:1021] + "..."
+                                photo_payload = (
+                                    BufferedInputFile(photo_bytes, filename=f"publication_{post_id}.jpg")
+                                    if photo_bytes is not None
+                                    else photo_file_id
+                                )
+                                await publish_bot.send_photo(
+                                    chat_id=telegram_id,
+                                    photo=photo_payload,
+                                    caption=caption,
+                                )
+                                if len(text) > 1024:
+                                    await publish_bot.send_message(telegram_id, text)
+                            else:
+                                await publish_bot.send_message(telegram_id, text)
+                            sent_any = True
+                        except Exception as exc:
+                            failed_count += 1
+                            if first_error is None:
+                                first_error = str(exc)
+
+                    if not recipients:
+                        mark_publication_post_failed(
+                            int(post_id),
+                            "Нет активных учеников с Telegram ID для рассылки.",
+                        )
+                        logger.warning("Publication %s skipped: no recipients", post_id)
+                    elif sent_any:
+                        mark_publication_post_sent(int(post_id))
+                        logger.info(
+                            "Publication %s sent: recipients=%s failed=%s photo=%s",
+                            post_id,
+                            len(recipients),
+                            failed_count,
+                            bool(photo_file_id),
+                        )
+                    else:
+                        error_text = f"Не удалось отправить публикацию получателям. Ошибок: {failed_count}"
+                        if first_error:
+                            error_text += f". Пример ошибки: {first_error}"
+                        mark_publication_post_failed(
+                            int(post_id),
+                            error_text,
+                        )
+                        logger.warning(
+                            "Publication %s failed: recipients=%s failed=%s first_error=%s",
+                            post_id,
+                            len(recipients),
+                            failed_count,
+                            first_error,
+                        )
+            except Exception as exc:
+                logger.exception("Publication worker error: %s", exc)
+
+            await asyncio.sleep(30)
+    finally:
+        if publish_bot is not bot:
+            await publish_bot.session.close()
 
 
 async def main():
@@ -27,8 +270,40 @@ async def main():
     maintenance_executed = run_startup_maintenance_from_env(preserve_superadmin_ids=SUPERADMINS)
     if maintenance_executed:
         logging.getLogger(__name__).info("Startup maintenance completed: student data reset for testing.")
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Запустить бота"),
+                BotCommand(command="menu", description="Открыть меню по роли"),
+            ]
+        )
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Failed to set bot commands on startup (will continue): %s",
+            exc,
+        )
     dp.include_router(router)
-    await dp.start_polling(bot)
+    report_task = asyncio.create_task(debt_report_worker())
+    publication_task = asyncio.create_task(publication_worker())
+    try:
+        while True:
+            try:
+                await dp.start_polling(bot)
+                break
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Admin polling crashed, retry in 5s: %s",
+                    exc,
+                )
+                await asyncio.sleep(5)
+    finally:
+        report_task.cancel()
+        publication_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await report_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await publication_task
 
 
 if __name__ == "__main__":

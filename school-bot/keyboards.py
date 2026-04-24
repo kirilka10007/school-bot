@@ -1,6 +1,6 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from data import TEACHERS_DATA
+from shared.database import get_teacher_catalog_names, get_teacher_catalog_subjects
 
 SUBJECTS = [
     "Математика",
@@ -15,13 +15,25 @@ SUBJECTS = [
 def get_all_teacher_names() -> list[str]:
     names: list[str] = []
 
-    for teachers in TEACHERS_DATA.values():
-        for teacher in teachers:
-            name = teacher.get("name")
-            if name and name not in names:
-                names.append(name)
+    for name in get_teacher_catalog_names():
+        if name and name not in names:
+            names.append(name)
 
     return names
+
+
+def get_all_subject_names() -> list[str]:
+    subjects: list[str] = []
+
+    for subject in get_teacher_catalog_subjects():
+        if subject and subject not in subjects:
+            subjects.append(subject)
+
+    for subject in SUBJECTS:
+        if subject not in subjects:
+            subjects.append(subject)
+
+    return subjects
 
 
 def get_back_button():
@@ -47,9 +59,17 @@ def get_main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def get_teacher_subject_keyboard():
+def get_teacher_subject_keyboard(subjects: list[str] | None = None):
+    subject_list = subjects or get_all_subject_names()
     buttons = []
-    for subject in SUBJECTS:
+    if not subject_list:
+        buttons.append(
+            [InlineKeyboardButton(text="Преподаватели пока не добавлены", callback_data="no_teachers_available")]
+        )
+        buttons.append([InlineKeyboardButton(text="Р’ РјРµРЅСЋ", callback_data="back_to_menu")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    for subject in subject_list:
         buttons.append(
             [InlineKeyboardButton(text=subject, callback_data=f"teacher_subject_{subject}")]
         )
@@ -132,7 +152,7 @@ def get_lesson_type_keyboard():
 def get_subjects_keyboard(selected_subjects: list[str]):
     buttons = []
 
-    for subject in SUBJECTS:
+    for subject in get_all_subject_names():
         prefix = "✅ " if subject in selected_subjects else ""
         buttons.append(
             [
@@ -159,8 +179,15 @@ def get_teacher_choice_keyboard():
 
 def get_teachers_keyboard():
     buttons = []
+    teachers = get_all_teacher_names()
+    if not teachers:
+        buttons.append(
+            [InlineKeyboardButton(text="Преподаватели пока не добавлены", callback_data="no_teachers_available")]
+        )
+        buttons.append(get_back_button())
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    for teacher in get_all_teacher_names():
+    for teacher in teachers:
         buttons.append(
             [InlineKeyboardButton(text=teacher, callback_data=f"teacher_{teacher}")]
         )
@@ -172,7 +199,7 @@ def get_teachers_keyboard():
 def get_contact_method_keyboard():
     buttons = [
         [InlineKeyboardButton(text="Telegram", callback_data="contact_Telegram")],
-        [InlineKeyboardButton(text="WhatsApp", callback_data="contact_WhatsApp")],
+        [InlineKeyboardButton(text="MAX", callback_data="contact_MAX")],
         [InlineKeyboardButton(text="Звонок", callback_data="contact_Звонок")],
         get_back_button(),
     ]
