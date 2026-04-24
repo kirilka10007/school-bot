@@ -227,7 +227,9 @@ async def notify_student_about_attendance(
         lines.extend(
             [
                 "",
-                f"Внимание: по данному направлению образовалась задолженность {abs(lesson_balance_after)} занят.",
+                "❗❗❗🔴 ВНИМАНИЕ! ОБРАЗОВАЛАСЬ ЗАДОЛЖЕННОСТЬ! 🔴❗❗❗",
+                f"Размер задолженности: {abs(lesson_balance_after)} занят.",
+                "❗❗❗ Пожалуйста, внесите оплату. ❗❗❗",
             ]
         )
         reply_markup = build_payment_prompt_keyboard()
@@ -320,8 +322,9 @@ async def notify_student_about_attendance_clean(
         lines.extend(
             [
                 "",
-                "ВНИМАНИЕ! У ВАС ЗАДОЛЖЕННОСТЬ!",
+                "❗❗❗🔴 ВНИМАНИЕ! У ВАС ЗАДОЛЖЕННОСТЬ! 🔴❗❗❗",
                 f"Размер задолженности: {abs(lesson_balance_after)} занят.",
+                "❗❗❗ Пожалуйста, внесите оплату. ❗❗❗",
             ]
         )
         reply_markup = build_payment_prompt_keyboard_clean()

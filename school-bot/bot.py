@@ -53,7 +53,7 @@ async def debt_reminder_worker(bot: Bot):
             for telegram_id, debts in grouped.items():
                 student_name = debts[0][1]
                 lines = [
-                    "ВНИМАНИЕ! У ВАС ЗАДОЛЖЕННОСТЬ!",
+                    "❗❗❗🔴 ВНИМАНИЕ! У ВАС ЗАДОЛЖЕННОСТЬ! 🔴❗❗❗",
                     "",
                     f"Ученик: {student_name}",
                     "",
@@ -64,7 +64,7 @@ async def debt_reminder_worker(bot: Bot):
                         f"- {subject_name} — {teacher_name}: задолженность {abs(lesson_balance)} занят."
                     )
                 lines.append("")
-                lines.append("Пожалуйста, внесите оплату или свяжитесь с администратором школы.")
+                lines.append("❗❗❗ Пожалуйста, внесите оплату или свяжитесь с администратором школы. ❗❗❗")
 
                 try:
                     await bot.send_message(telegram_id, "\n".join(lines))
