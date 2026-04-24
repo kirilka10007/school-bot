@@ -121,6 +121,17 @@ def get_teacher_subject_picker_keyboard(subjects: list[str]):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def get_edit_teacher_subject_picker_keyboard(subjects: list[str]):
+    buttons = []
+    for index, subject in enumerate(subjects[:20]):
+        buttons.append(
+            [InlineKeyboardButton(text=subject[:64], callback_data=f"edit_teacher_subject_pick_{index}")]
+        )
+    buttons.append([InlineKeyboardButton(text="Добавить новый предмет", callback_data="edit_teacher_subject_add_new")])
+    buttons.append([InlineKeyboardButton(text="Главное меню", callback_data="menu_home")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 def get_tariff_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[

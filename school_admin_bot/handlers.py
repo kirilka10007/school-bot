@@ -33,6 +33,7 @@ from keyboards import (
     get_subject_selection_keyboard,
     get_assign_subject_rename_keyboard,
     get_teacher_subject_picker_keyboard,
+    get_edit_teacher_subject_picker_keyboard,
     get_publication_audience_keyboard,
     get_publication_schedule_keyboard,
 )
@@ -2845,8 +2846,61 @@ async def process_edit_teacher_full_name(message: Message, state: FSMContext):
             return
         await state.update_data(edit_teacher_full_name=text)
 
-    await message.answer("Введите новый предмет или '-' чтобы оставить текущий.")
+    subjects = [item for item in get_teacher_catalog_subjects() if item]
+    if subjects:
+        await state.update_data(
+            edit_teacher_subject_options=subjects,
+            edit_teacher_subject_custom=False,
+        )
+        await message.answer(
+            "Выберите основной предмет из списка или нажмите «Добавить новый предмет»:",
+            reply_markup=get_edit_teacher_subject_picker_keyboard(subjects),
+        )
+    else:
+        await state.update_data(
+            edit_teacher_subject_options=[],
+            edit_teacher_subject_custom=True,
+        )
+        await message.answer("Список предметов пуст. Введите новый основной предмет текстом.")
     await state.set_state(AdminStates.waiting_edit_teacher_subject)
+
+
+@router.callback_query(
+    AdminStates.waiting_edit_teacher_subject,
+    lambda c: c.data.startswith("edit_teacher_subject_pick_") or c.data == "edit_teacher_subject_add_new",
+)
+async def process_edit_teacher_subject_pick(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in SUPERADMINS:
+        await callback.answer("Нет доступа", show_alert=True)
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    subjects = data.get("edit_teacher_subject_options") or []
+
+    if callback.data == "edit_teacher_subject_add_new":
+        await state.update_data(edit_teacher_subject_custom=True)
+        await callback.message.answer("Введите новый основной предмет текстом:")
+        await callback.answer()
+        return
+
+    try:
+        subject_index = int(callback.data.split("_")[-1])
+    except (TypeError, ValueError):
+        await callback.answer("Не удалось определить предмет", show_alert=True)
+        return
+
+    if subject_index < 0 or subject_index >= len(subjects):
+        await callback.answer("Предмет не найден в текущем списке", show_alert=True)
+        return
+
+    subject_name = subjects[subject_index]
+    await state.update_data(edit_teacher_subject=subject_name, edit_teacher_subject_custom=False)
+    await callback.message.answer(
+        "Введите новое описание, '-' чтобы оставить текущее, или 'очистить' чтобы убрать описание."
+    )
+    await state.set_state(AdminStates.waiting_edit_teacher_description)
+    await callback.answer()
 
 
 @router.message(AdminStates.waiting_edit_teacher_subject)
@@ -2856,12 +2910,19 @@ async def process_edit_teacher_subject(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    text = message.text.strip()
-    if text != "-":
+    text = (message.text or "").strip()
+    is_custom = bool((await state.get_data()).get("edit_teacher_subject_custom"))
+    if not is_custom and text == "-":
+        await message.answer("Выберите предмет кнопкой или нажмите «Добавить новый предмет».")
+        return
+
+    if text == "-":
+        pass
+    else:
         if len(text) < 2:
-            await message.answer("Введите корректный предмет или '-'.")
+            await message.answer("Введите корректный предмет.")
             return
-        await state.update_data(edit_teacher_subject=text)
+        await state.update_data(edit_teacher_subject=text, edit_teacher_subject_custom=True)
 
     await message.answer(
         "Введите новое описание, '-' чтобы оставить текущее, или 'очистить' чтобы убрать описание."

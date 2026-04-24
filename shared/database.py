@@ -496,11 +496,25 @@ def _sync_teacher_subject_links():
     )
     cur.execute(
         """
-        INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_name)
-        SELECT teacher_id, subject_name
-        FROM student_lessons
-        WHERE subject_name IS NOT NULL
-          AND TRIM(subject_name) <> ''
+        DELETE FROM teacher_subjects
+        WHERE subject_name IS NULL
+           OR TRIM(subject_name) = ''
+           OR teacher_id NOT IN (SELECT id FROM teachers)
+        """
+    )
+    cur.execute(
+        """
+        DELETE FROM teacher_subjects
+        WHERE EXISTS (
+            SELECT 1
+            FROM teachers t
+            WHERE t.id = teacher_subjects.teacher_id
+              AND (
+                  t.subject_name IS NULL
+                  OR TRIM(t.subject_name) = ''
+                  OR TRIM(t.subject_name) <> TRIM(teacher_subjects.subject_name)
+              )
+        )
         """
     )
     conn.commit()
