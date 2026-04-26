@@ -10,7 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from config import SCHOOL_BOT_TOKEN, SCHOOL_BOT_USERNAME, SUPERADMINS
+from config import SCHOOL_BOT_PAYMENTS_CHAT_ID, SCHOOL_BOT_TOKEN, SCHOOL_BOT_USERNAME, SUPERADMINS
 from keyboards import (
     get_superadmin_menu,
     get_superadmin_users_menu,
@@ -738,6 +738,74 @@ async def admin_publication_new(callback: CallbackQuery, state: FSMContext):
     )
     await state.set_state(AdminStates.waiting_publication_description)
     await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "admin_payment_chat_message")
+async def admin_payment_chat_message(callback: CallbackQuery, state: FSMContext):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await state.clear()
+    await callback.message.answer(
+        "Введите сообщение для чата оплат.\n"
+        "Оно будет отправлено от имени бота в чат оплат.",
+        reply_markup=get_main_menu_shortcut_keyboard(),
+    )
+    await state.set_state(AdminStates.waiting_payment_chat_message)
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_payment_chat_message)
+async def admin_payment_chat_message_send(message: Message, state: FSMContext):
+    if not is_admin_role(message.from_user.id):
+        await message.answer("Нет доступа.")
+        await state.clear()
+        return
+
+    if not SCHOOL_BOT_PAYMENTS_CHAT_ID:
+        await message.answer(
+            "Не задан SCHOOL_BOT_PAYMENTS_CHAT_ID в .env.",
+            reply_markup=get_admin_reply_menu(message.from_user.id),
+        )
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Введите текст сообщения.")
+        return
+
+    sender_name = message.from_user.full_name or "Администратор"
+    payload = f"Сообщение от администратора {sender_name}:\n\n{text}"
+
+    try:
+        if SCHOOL_BOT_TOKEN:
+            async with Bot(token=SCHOOL_BOT_TOKEN) as school_bot:
+                await school_bot.send_message(SCHOOL_BOT_PAYMENTS_CHAT_ID, payload)
+        else:
+            await message.bot.send_message(SCHOOL_BOT_PAYMENTS_CHAT_ID, payload)
+    except Exception as exc:
+        await message.answer(
+            f"Не удалось отправить сообщение в чат оплат: {exc}",
+            reply_markup=get_admin_reply_menu(message.from_user.id),
+        )
+        await state.clear()
+        return
+
+    log_admin_action(
+        admin_telegram_id=message.from_user.id,
+        action_type="manual_message_to_payments_chat",
+        target_type="chat",
+        target_id=SCHOOL_BOT_PAYMENTS_CHAT_ID,
+        details={"text_preview": text[:200]},
+        status="success",
+    )
+    await message.answer(
+        "Сообщение отправлено в чат оплат.",
+        reply_markup=get_admin_reply_menu(message.from_user.id),
+    )
+    await state.clear()
 
 
 @router.message(AdminStates.waiting_publication_description)

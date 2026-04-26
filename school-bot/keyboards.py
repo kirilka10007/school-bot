@@ -1,6 +1,10 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from shared.database import get_teacher_catalog_names, get_teacher_catalog_subjects
+from shared.database import (
+    get_teacher_catalog_name_subject_pairs,
+    get_teacher_catalog_names,
+    get_teacher_catalog_subjects,
+)
 
 SUBJECTS = [
     "Математика",
@@ -14,6 +18,14 @@ SUBJECTS = [
 
 def get_all_teacher_names() -> list[str]:
     names: list[str] = []
+
+    pairs = get_teacher_catalog_name_subject_pairs()
+    if pairs:
+        for full_name, subject_name in pairs:
+            label = f"{full_name} - {subject_name}"
+            if label not in names:
+                names.append(label)
+        return names
 
     for name in get_teacher_catalog_names():
         if name and name not in names:

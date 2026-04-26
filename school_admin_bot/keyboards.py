@@ -31,6 +31,7 @@ def get_superadmin_school_menu():
         inline_keyboard=[
             [InlineKeyboardButton(text="Добавить ученика", callback_data="admin_add_student")],
             [InlineKeyboardButton(text="Публикация ученикам", callback_data="admin_publication_new")],
+            [InlineKeyboardButton(text="Сообщение в чат оплат", callback_data="admin_payment_chat_message")],
             [InlineKeyboardButton(text="Добавить карточку отзыва", callback_data="admin_review_new")],
             [InlineKeyboardButton(text="Назначить предмет/преподавателя", callback_data="admin_assign_lesson")],
             [InlineKeyboardButton(text="Привязать Telegram преподавателя", callback_data="admin_bind_teacher_telegram")],
@@ -58,6 +59,7 @@ def get_admin_menu():
         inline_keyboard=[
             [InlineKeyboardButton(text="Добавить ученика", callback_data="admin_add_student")],
             [InlineKeyboardButton(text="Публикация ученикам", callback_data="admin_publication_new")],
+            [InlineKeyboardButton(text="Сообщение в чат оплат", callback_data="admin_payment_chat_message")],
             [InlineKeyboardButton(text="Добавить карточку отзыва", callback_data="admin_review_new")],
             [InlineKeyboardButton(text="Назначить предмет/преподавателя", callback_data="admin_assign_lesson")],
             [InlineKeyboardButton(text="Привязать Telegram преподавателя", callback_data="admin_bind_teacher_telegram")],

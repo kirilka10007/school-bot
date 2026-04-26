@@ -42,9 +42,20 @@ def _parse_int_list(raw: str) -> list[int]:
     return result
 
 
+def _parse_optional_int(key: str) -> int | None:
+    raw = (os.getenv(key) or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{key} must be an integer, got: {raw}") from exc
+
+
 _load_env()
 
 BOT_TOKEN = _require("SCHOOL_ADMIN_BOT_TOKEN")
 SUPERADMINS = _parse_int_list(_require("SCHOOL_ADMIN_SUPERADMINS"))
 SCHOOL_BOT_TOKEN = os.getenv("SCHOOL_BOT_TOKEN", "").strip() or None
 SCHOOL_BOT_USERNAME = os.getenv("SCHOOL_BOT_USERNAME", "").strip().lstrip("@") or None
+SCHOOL_BOT_PAYMENTS_CHAT_ID = _parse_optional_int("SCHOOL_BOT_PAYMENTS_CHAT_ID")

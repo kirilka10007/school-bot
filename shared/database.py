@@ -534,21 +534,7 @@ def _sync_teacher_subject_links():
            OR teacher_id NOT IN (SELECT id FROM teachers)
         """
     )
-    cur.execute(
-        """
-        DELETE FROM teacher_subjects
-        WHERE EXISTS (
-            SELECT 1
-            FROM teachers t
-            WHERE t.id = teacher_subjects.teacher_id
-              AND (
-                  t.subject_name IS NULL
-                  OR TRIM(t.subject_name) = ''
-                  OR TRIM(t.subject_name) <> TRIM(teacher_subjects.subject_name)
-              )
-        )
-        """
-    )
+    # Do not force single-subject mode: a teacher can be linked to multiple subjects.
     conn.commit()
     conn.close()
 
@@ -1154,7 +1140,7 @@ def add_or_update_teacher_profile(
             )
             conn.commit()
             conn.close()
-            replace_teacher_subject_links(teacher_id, subject_name)
+            ensure_teacher_subject_link(teacher_id, subject_name)
             return teacher_id
 
     cur.execute(
@@ -1197,7 +1183,7 @@ def add_or_update_teacher_profile(
     teacher_id = int(cur.lastrowid)
     conn.commit()
     conn.close()
-    replace_teacher_subject_links(teacher_id, subject_name)
+    ensure_teacher_subject_link(teacher_id, subject_name)
     return teacher_id
 
 
@@ -2675,7 +2661,7 @@ def update_teacher_profile_fields(
     changed = cur.rowcount > 0
     conn.commit()
     conn.close()
-    replace_teacher_subject_links(teacher_id, subject_name)
+    ensure_teacher_subject_link(teacher_id, subject_name)
     return changed
 
 
@@ -3236,22 +3222,7 @@ def cleanup_orphan_teacher_subjects() -> dict:
     )
     deleted_invalid = int(cur.rowcount or 0)
 
-    cur.execute(
-        """
-        DELETE FROM teacher_subjects
-        WHERE EXISTS (
-            SELECT 1
-            FROM teachers t
-            WHERE t.id = teacher_subjects.teacher_id
-              AND (
-                  t.subject_name IS NULL
-                  OR TRIM(t.subject_name) = ''
-                  OR TRIM(t.subject_name) <> TRIM(teacher_subjects.subject_name)
-              )
-        )
-        """
-    )
-    deleted_not_linked = int(cur.rowcount or 0)
+    deleted_not_linked = 0
 
     cur.execute("SELECT COUNT(1) FROM teacher_subjects")
     after_total = int(cur.fetchone()[0] or 0)
@@ -3283,6 +3254,40 @@ def get_teacher_catalog_names() -> list[str]:
     return [row[0] for row in rows]
 
 
+def get_teacher_catalog_name_subject_pairs() -> list[tuple[str, str]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT full_name, subject_name
+        FROM (
+            SELECT
+                t.full_name AS full_name,
+                ts.subject_name AS subject_name
+            FROM teachers t
+            JOIN teacher_subjects ts ON ts.teacher_id = t.id
+            WHERE t.full_name IS NOT NULL
+              AND TRIM(t.full_name) <> ''
+              AND ts.subject_name IS NOT NULL
+              AND TRIM(ts.subject_name) <> ''
+            UNION
+            SELECT
+                t.full_name AS full_name,
+                t.subject_name AS subject_name
+            FROM teachers t
+            WHERE t.full_name IS NOT NULL
+              AND TRIM(t.full_name) <> ''
+              AND t.subject_name IS NOT NULL
+              AND TRIM(t.subject_name) <> ''
+        )
+        ORDER BY full_name, subject_name
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [(str(row[0]), str(row[1])) for row in rows]
+
+
 def get_teacher_cards_by_subject(subject_name: str) -> list[dict]:
     conn = get_connection()
     cur = conn.cursor()
@@ -3290,10 +3295,16 @@ def get_teacher_cards_by_subject(subject_name: str) -> list[dict]:
         """
         SELECT DISTINCT t.id, t.full_name, t.description, t.photo_path, t.telegram_id
         FROM teachers t
-        WHERE t.subject_name = ?
+        WHERE COALESCE(t.subject_name, '') = ?
+           OR EXISTS (
+                SELECT 1
+                FROM teacher_subjects ts
+                WHERE ts.teacher_id = t.id
+                  AND ts.subject_name = ?
+           )
         ORDER BY t.id
         """,
-        (subject_name,),
+        (subject_name, subject_name),
     )
     rows = cur.fetchall()
     conn.close()

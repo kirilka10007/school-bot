@@ -46,6 +46,7 @@ class AdminStates(StatesGroup):
     waiting_publication_audience = State()
     waiting_publication_schedule_mode = State()
     waiting_publication_schedule_datetime = State()
+    waiting_payment_chat_message = State()
 
     waiting_review_description = State()
     waiting_review_media = State()
