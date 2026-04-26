@@ -84,6 +84,7 @@ from shared.database import (
     mark_onboarding_invite_used,
     upsert_known_telegram_user,
     create_publication_post,
+    create_review_card,
 )
 
 router = Router()
@@ -581,6 +582,15 @@ def parse_publication_schedule(value: str) -> datetime | None:
     return None
 
 
+def build_links_block(links: list[str]) -> str:
+    if not links:
+        return ""
+    lines = ["", "<b>Ссылки:</b>"]
+    for idx, link in enumerate(links, start=1):
+        lines.append(f"{idx}. {link}")
+    return "\n".join(lines)
+
+
 @router.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     await state.clear()
@@ -927,6 +937,131 @@ async def admin_publication_schedule_datetime(message: Message, state: FSMContex
     await state.clear()
     await message.answer(
         f"Публикация запланирована на {schedule_dt.strftime('%d.%m.%Y %H:%M')} МСК (ID: {post_id}).",
+        reply_markup=get_admin_reply_menu(message.from_user.id),
+    )
+
+
+@router.callback_query(lambda c: c.data == "admin_review_new")
+async def admin_review_new(callback: CallbackQuery, state: FSMContext):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await state.clear()
+    await callback.message.answer(
+        "Введите текст карточки отзыва.\n"
+        "Описание обязательное.",
+        reply_markup=get_main_menu_shortcut_keyboard(),
+    )
+    await state.set_state(AdminStates.waiting_review_description)
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_review_description)
+async def admin_review_description(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if len(text) < 3:
+        await message.answer("Описание слишком короткое. Введите более подробный текст.")
+        return
+
+    await state.update_data(review_description=text)
+    await message.answer(
+        "Теперь отправьте фото или файл (pdf/doc), если нужно.\n"
+        "Если медиа не требуется, отправьте символ: -"
+    )
+    await state.set_state(AdminStates.waiting_review_media)
+
+
+@router.message(AdminStates.waiting_review_media)
+async def admin_review_media(message: Message, state: FSMContext):
+    media_file_id = None
+    media_type = None
+    text_value = (message.text or "").strip()
+
+    if message.photo:
+        media_file_id = message.photo[-1].file_id
+        media_type = "photo"
+    elif message.document:
+        media_file_id = message.document.file_id
+        media_type = "document"
+    elif text_value != "-":
+        await message.answer("Отправьте фото/файл или символ -, чтобы пропустить.")
+        return
+
+    await state.update_data(review_media_file_id=media_file_id, review_media_type=media_type)
+    await message.answer(
+        "Добавьте ссылки (через пробел/новую строку).\n"
+        "Можно использовать URL или @username.\n"
+        "Если ссылки не нужны, отправьте: -"
+    )
+    await state.set_state(AdminStates.waiting_review_links)
+
+
+@router.message(AdminStates.waiting_review_links)
+async def admin_review_links(message: Message, state: FSMContext):
+    if not is_admin_role(message.from_user.id):
+        await message.answer("Нет доступа.")
+        await state.clear()
+        return
+
+    raw = (message.text or "").strip()
+    links = parse_publication_links(raw)
+    if raw and raw != "-" and not links:
+        await message.answer(
+            "Не удалось распознать ссылки.\n"
+            "Используйте формат https://... или @username, либо отправьте -."
+        )
+        return
+
+    data = await state.get_data()
+    description = (data.get("review_description") or "").strip()
+    media_file_id = data.get("review_media_file_id")
+    media_type = data.get("review_media_type")
+
+    if not description:
+        await state.clear()
+        await message.answer("Сценарий создания отзыва сброшен. Запустите заново.")
+        return
+
+    review_id = create_review_card(
+        created_by=message.from_user.id,
+        description=description,
+        media_file_id=media_file_id,
+        media_type=media_type,
+        links=links,
+    )
+    log_admin_action(
+        admin_telegram_id=message.from_user.id,
+        action_type="review_card_created",
+        target_type="review_card",
+        target_id=review_id,
+        details={
+            "has_media": bool(media_file_id),
+            "media_type": media_type,
+            "links_count": len(links),
+        },
+        status="success",
+    )
+
+    caption = (
+        f"<b>Отзыв #{review_id}</b>\n\n"
+        f"{description}"
+        f"{build_links_block(links)}"
+    )
+
+    try:
+        if media_file_id and media_type == "photo":
+            await message.answer_photo(photo=media_file_id, caption=caption, parse_mode="HTML")
+        elif media_file_id and media_type == "document":
+            await message.answer_document(document=media_file_id, caption=caption, parse_mode="HTML")
+        else:
+            await message.answer(caption, parse_mode="HTML")
+    except Exception:
+        await message.answer(caption, parse_mode="HTML")
+
+    await state.clear()
+    await message.answer(
+        "Карточка отзыва создана и будет отображаться ученикам в разделе «Отзывы».",
         reply_markup=get_admin_reply_menu(message.from_user.id),
     )
 
@@ -1929,7 +2064,7 @@ async def admin_add_balance(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    await callback.message.answer("Введи имя или часть имени ученика для начисления занятий:")
+    await callback.message.answer("Введи имя или часть имени ученика для корректировки баланса:")
     await state.set_state(AdminStates.waiting_balance_student_search)
     await callback.answer()
 
@@ -1968,7 +2103,7 @@ async def balance_student_search(message: Message, state: FSMContext):
         return
 
     await message.answer(
-        f"Выбери направление для начисления ученику {full_name}:",
+        f"Выбери направление для корректировки баланса ученика {full_name}:",
         reply_markup=get_balance_direction_keyboard(directions)
     )
     await state.clear()
@@ -1994,7 +2129,7 @@ async def choose_balance_direction(callback: CallbackQuery):
         f"Предмет: {subject_name}\n"
         f"Преподаватель: {teacher_name}\n"
         f"Текущий баланс: {lesson_balance}\n\n"
-        f"Сколько занятий начислить?",
+        f"Выберите, на сколько изменить баланс (+ или -):",
         reply_markup=get_balance_add_keyboard(direction_id)
     )
     await callback.answer()
@@ -2021,27 +2156,30 @@ async def add_balance_to_direction(callback: CallbackQuery):
         direction_id,
         lessons_to_add,
         created_by=callback.from_user.id,
-        comment="Ручное начисление админом"
+        comment="Ручная корректировка баланса админом"
     )
     log_admin_action(
         admin_telegram_id=callback.from_user.id,
-        action_type="manual_balance_topup",
+        action_type="manual_balance_adjust",
         target_type="student_lesson",
         target_id=direction_id,
-        details={"lessons_to_add": lessons_to_add},
+        details={"lessons_delta": lessons_to_add},
         status="success",
     )
 
     updated_lesson = get_student_lesson_by_id(direction_id)
     _, _, _, _, lesson_balance_after, _, _, _ = updated_lesson
 
+    operation_text = "Начислено" if lessons_to_add > 0 else "Убавлено"
+    operation_amount = abs(lessons_to_add)
+
     await callback.message.answer(
-        f"✅ Баланс пополнен\n\n"
+        f"✅ Баланс обновлен\n\n"
         f"Ученик: {student_name}\n"
         f"Предмет: {subject_name}\n"
         f"Преподаватель: {teacher_name}\n"
         f"Баланс был: {lesson_balance_before}\n"
-        f"Начислено: {lessons_to_add}\n"
+        f"{operation_text}: {operation_amount}\n"
         f"Баланс стал: {lesson_balance_after}",
         reply_markup=get_admin_reply_menu(callback.from_user.id) if is_admin_role(callback.from_user.id) else get_teacher_menu()
     )

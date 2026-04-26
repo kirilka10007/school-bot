@@ -3,7 +3,6 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from data import load_reviews_from_folder
 from keyboards import (
     get_main_menu_keyboard,
     get_teacher_subject_keyboard,
@@ -32,6 +31,7 @@ from .common import (
     build_recent_payments_text,
     edit_review_card,
     edit_teacher_card,
+    get_review_cards,
     get_teacher_cards_for_subject,
     send_review_card,
     send_teacher_card,
@@ -191,7 +191,7 @@ async def menu_teachers(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(ApplicationForm.menu, lambda c: c.data == "menu_reviews")
 async def menu_reviews(callback: CallbackQuery, state: FSMContext):
-    reviews = load_reviews_from_folder()
+    reviews = get_review_cards()
 
     if not reviews:
         await callback.message.answer("Отзывы пока не добавлены.")
@@ -246,7 +246,7 @@ async def menu_cabinet(callback: CallbackQuery, state: FSMContext):
     ApplicationForm.review_card, lambda c: c.data in ["review_prev", "review_next"]
 )
 async def navigate_reviews(callback: CallbackQuery, state: FSMContext):
-    reviews = load_reviews_from_folder()
+    reviews = get_review_cards()
     data = await state.get_data()
     index = data["selected_review_index"]
 

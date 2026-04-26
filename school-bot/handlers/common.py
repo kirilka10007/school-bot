@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, FSInputFile, InputMediaPhoto, Message
+from aiogram.types import CallbackQuery, FSInputFile, InputMediaDocument, InputMediaPhoto, Message
 
 from data import load_reviews_from_folder
 from keyboards import (
@@ -11,7 +11,7 @@ from keyboards import (
     get_teacher_card_keyboard,
 )
 from states import ApplicationForm
-from shared.database import get_active_admin_contacts, get_teacher_cards_by_subject
+from shared.database import get_active_admin_contacts, get_active_review_cards, get_teacher_cards_by_subject
 
 BOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -54,6 +54,34 @@ def get_teacher_cards_for_subject(subject: str) -> list[dict]:
         )
 
     return normalized
+
+
+def get_review_cards() -> list[dict]:
+    cards: list[dict] = []
+
+    for card in get_active_review_cards(limit=500):
+        cards.append(
+            {
+                "id": card.get("id"),
+                "description": card.get("description") or "Отзыв",
+                "media_type": card.get("media_type"),
+                "media_file_id": card.get("media_file_id"),
+                "links": card.get("links") or [],
+            }
+        )
+
+    for item in load_reviews_from_folder():
+        cards.append(
+            {
+                "id": None,
+                "description": "Отзыв ученика",
+                "media_type": "photo",
+                "media_file_id": item.get("image"),
+                "links": [],
+            }
+        )
+
+    return cards
 
 
 def _get_photo_media(photo_ref: str | None):
@@ -288,7 +316,7 @@ async def edit_teacher_card(
 
 
 async def send_review_card(message_obj: Message, index: int, state: FSMContext):
-    reviews = load_reviews_from_folder()
+    reviews = get_review_cards()
 
     if not reviews:
         await message_obj.answer("Отзывы пока не добавлены.")
@@ -297,20 +325,45 @@ async def send_review_card(message_obj: Message, index: int, state: FSMContext):
     review = reviews[index]
     total = len(reviews)
 
-    caption = f"Отзыв {index + 1} из {total}"
-    photo = FSInputFile(resolve_local_path(review["image"]))
+    links = review.get("links") or []
+    links_text = "\n".join(f"{pos}. {link}" for pos, link in enumerate(links, start=1))
+    caption = f"Отзыв {index + 1} из {total}\n\n{review.get('description', '')}".strip()
+    if links_text:
+        caption = f"{caption}\n\nСсылки:\n{links_text}"
 
     await state.update_data(selected_review_index=index)
 
-    await message_obj.answer_photo(
-        photo=photo,
-        caption=caption,
+    media_type = review.get("media_type")
+    media_ref = review.get("media_file_id")
+    try:
+        if media_type == "photo" and media_ref:
+            photo = media_ref
+            if isinstance(photo, str) and "/" in photo:
+                photo = FSInputFile(resolve_local_path(photo))
+            await message_obj.answer_photo(
+                photo=photo,
+                caption=caption,
+                reply_markup=get_review_card_keyboard(index, total),
+            )
+            return
+        if media_type == "document" and media_ref:
+            await message_obj.answer_document(
+                document=media_ref,
+                caption=caption,
+                reply_markup=get_review_card_keyboard(index, total),
+            )
+            return
+    except Exception:
+        pass
+
+    await message_obj.answer(
+        caption,
         reply_markup=get_review_card_keyboard(index, total),
     )
 
 
 async def edit_review_card(callback: CallbackQuery, index: int, state: FSMContext):
-    reviews = load_reviews_from_folder()
+    reviews = get_review_cards()
 
     if not reviews:
         await callback.message.answer("Отзывы пока не добавлены.")
@@ -319,12 +372,36 @@ async def edit_review_card(callback: CallbackQuery, index: int, state: FSMContex
     review = reviews[index]
     total = len(reviews)
 
-    caption = f"Отзыв {index + 1} из {total}"
-    photo = FSInputFile(resolve_local_path(review["image"]))
+    links = review.get("links") or []
+    links_text = "\n".join(f"{pos}. {link}" for pos, link in enumerate(links, start=1))
+    caption = f"Отзыв {index + 1} из {total}\n\n{review.get('description', '')}".strip()
+    if links_text:
+        caption = f"{caption}\n\nСсылки:\n{links_text}"
 
     await state.update_data(selected_review_index=index)
 
-    await callback.message.edit_media(
-        media={"type": "photo", "media": photo, "caption": caption},
+    media_type = review.get("media_type")
+    media_ref = review.get("media_file_id")
+    try:
+        if media_type == "photo" and media_ref:
+            photo = media_ref
+            if isinstance(photo, str) and "/" in photo:
+                photo = FSInputFile(resolve_local_path(photo))
+            await callback.message.edit_media(
+                media=InputMediaPhoto(media=photo, caption=caption),
+                reply_markup=get_review_card_keyboard(index, total),
+            )
+            return
+        if media_type == "document" and media_ref:
+            await callback.message.edit_media(
+                media=InputMediaDocument(media=media_ref, caption=caption),
+                reply_markup=get_review_card_keyboard(index, total),
+            )
+            return
+    except Exception:
+        pass
+
+    await callback.message.edit_text(
+        caption,
         reply_markup=get_review_card_keyboard(index, total),
     )

@@ -31,10 +31,11 @@ def get_superadmin_school_menu():
         inline_keyboard=[
             [InlineKeyboardButton(text="Добавить ученика", callback_data="admin_add_student")],
             [InlineKeyboardButton(text="Публикация ученикам", callback_data="admin_publication_new")],
+            [InlineKeyboardButton(text="Добавить карточку отзыва", callback_data="admin_review_new")],
             [InlineKeyboardButton(text="Назначить предмет/преподавателя", callback_data="admin_assign_lesson")],
             [InlineKeyboardButton(text="Привязать Telegram преподавателя", callback_data="admin_bind_teacher_telegram")],
             [InlineKeyboardButton(text="Найти ученика", callback_data="admin_find_student")],
-            [InlineKeyboardButton(text="Начислить занятия", callback_data="admin_add_balance")],
+            [InlineKeyboardButton(text="Корректировка баланса", callback_data="admin_add_balance")],
             [InlineKeyboardButton(text="Посещаемость", callback_data="admin_attendance")],
             [InlineKeyboardButton(text="История баланса", callback_data="admin_balance_history")],
             [InlineKeyboardButton(text="Назад", callback_data="superadmin_back_main")],
@@ -57,11 +58,12 @@ def get_admin_menu():
         inline_keyboard=[
             [InlineKeyboardButton(text="Добавить ученика", callback_data="admin_add_student")],
             [InlineKeyboardButton(text="Публикация ученикам", callback_data="admin_publication_new")],
+            [InlineKeyboardButton(text="Добавить карточку отзыва", callback_data="admin_review_new")],
             [InlineKeyboardButton(text="Назначить предмет/преподавателя", callback_data="admin_assign_lesson")],
             [InlineKeyboardButton(text="Привязать Telegram преподавателя", callback_data="admin_bind_teacher_telegram")],
             [InlineKeyboardButton(text="Удалить преподавателя/ученика", callback_data="admin_delete_user")],
             [InlineKeyboardButton(text="Найти ученика", callback_data="admin_find_student")],
-            [InlineKeyboardButton(text="Начислить занятия", callback_data="admin_add_balance")],
+            [InlineKeyboardButton(text="Корректировка баланса", callback_data="admin_add_balance")],
             [InlineKeyboardButton(text="Посещаемость", callback_data="admin_attendance")],
             [InlineKeyboardButton(text="История баланса", callback_data="admin_balance_history")],
             [InlineKeyboardButton(text="Отчет по долгам", callback_data="admin_debt_report")],
@@ -207,6 +209,10 @@ def get_balance_add_keyboard(direction_id: int):
             [InlineKeyboardButton(text="+4", callback_data=f"balance_add_{direction_id}_4")],
             [InlineKeyboardButton(text="+8", callback_data=f"balance_add_{direction_id}_8")],
             [InlineKeyboardButton(text="+12", callback_data=f"balance_add_{direction_id}_12")],
+            [InlineKeyboardButton(text="-1", callback_data=f"balance_add_{direction_id}_-1")],
+            [InlineKeyboardButton(text="-4", callback_data=f"balance_add_{direction_id}_-4")],
+            [InlineKeyboardButton(text="-8", callback_data=f"balance_add_{direction_id}_-8")],
+            [InlineKeyboardButton(text="-12", callback_data=f"balance_add_{direction_id}_-12")],
         ]
     )
 

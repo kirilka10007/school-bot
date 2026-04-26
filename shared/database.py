@@ -379,6 +379,23 @@ def init_db():
 
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS review_cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_by INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            media_file_id TEXT,
+            media_type TEXT,
+            links_json TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        )
+        """
+    )
+    _ensure_review_cards_columns(cur)
+
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS maintenance_runs (
             task_name TEXT PRIMARY KEY,
             executed_at TEXT NOT NULL
@@ -482,6 +499,21 @@ def _ensure_publication_posts_columns(cur: sqlite3.Cursor):
         cur.execute("ALTER TABLE publication_posts ADD COLUMN audience TEXT NOT NULL DEFAULT 'students'")
 
 
+def _ensure_review_cards_columns(cur: sqlite3.Cursor):
+    cur.execute("PRAGMA table_info(review_cards)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+    if "media_file_id" not in existing_columns:
+        cur.execute("ALTER TABLE review_cards ADD COLUMN media_file_id TEXT")
+    if "media_type" not in existing_columns:
+        cur.execute("ALTER TABLE review_cards ADD COLUMN media_type TEXT")
+    if "links_json" not in existing_columns:
+        cur.execute("ALTER TABLE review_cards ADD COLUMN links_json TEXT")
+    if "is_active" not in existing_columns:
+        cur.execute("ALTER TABLE review_cards ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+    if "updated_at" not in existing_columns:
+        cur.execute("ALTER TABLE review_cards ADD COLUMN updated_at TEXT")
+
+
 def _sync_teacher_subject_links():
     conn = get_connection()
     cur = conn.cursor()
@@ -550,6 +582,7 @@ def _ensure_postgres_bigint_columns(cur):
         "known_telegram_users": {"telegram_id"},
         "onboarding_invites": {"created_by", "used_by_telegram_id"},
         "publication_posts": {"created_by"},
+        "review_cards": {"created_by"},
     }
 
     cur.execute(
@@ -2848,6 +2881,92 @@ def create_publication_post(
     conn.commit()
     conn.close()
     return post_id
+
+
+def create_review_card(
+    *,
+    created_by: int,
+    description: str,
+    media_file_id: str | None = None,
+    media_type: str | None = None,
+    links: list[str] | None = None,
+) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    links_json = json.dumps(links or [], ensure_ascii=False)
+    cur.execute(
+        """
+        INSERT INTO review_cards (
+            created_by,
+            description,
+            media_file_id,
+            media_type,
+            links_json,
+            is_active,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+        """,
+        (
+            created_by,
+            description.strip(),
+            media_file_id,
+            media_type,
+            links_json,
+            now,
+            now,
+        ),
+    )
+    review_id = int(cur.lastrowid) if cur.lastrowid is not None else 0
+    conn.commit()
+    conn.close()
+    return review_id
+
+
+def get_active_review_cards(limit: int = 200) -> list[dict]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            id,
+            description,
+            media_file_id,
+            media_type,
+            links_json,
+            created_at
+        FROM review_cards
+        WHERE is_active = 1
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    result: list[dict] = []
+    for row in rows:
+        links_value = row[4] or "[]"
+        try:
+            links = json.loads(links_value)
+            if not isinstance(links, list):
+                links = []
+        except Exception:
+            links = []
+        result.append(
+            {
+                "id": int(row[0]),
+                "description": (row[1] or "").strip(),
+                "media_file_id": row[2],
+                "media_type": (row[3] or "").strip() or None,
+                "links": [str(link).strip() for link in links if str(link).strip()][:8],
+                "created_at": row[5],
+            }
+        )
+    return result
 
 
 def get_due_publication_posts(limit: int = 20, now_ts: str | None = None):
