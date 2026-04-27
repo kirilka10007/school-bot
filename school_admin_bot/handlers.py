@@ -2871,6 +2871,8 @@ async def admin_debtor_details(callback: CallbackQuery):
 @router.callback_query(lambda c: c.data.startswith("admin_debtor_"))
 async def admin_debtor_details_v2(callback: CallbackQuery):
     try:
+        await callback.answer()
+
         if not is_admin_role(callback.from_user.id):
             await callback.answer("Нет доступа", show_alert=True)
             return
@@ -2894,35 +2896,25 @@ async def admin_debtor_details_v2(callback: CallbackQuery):
         phone = details.get("phone") or "-"
 
         lines = [
-            f"Должник: <b>{full_name}</b>",
+            f"Должник: {full_name}",
             f"Username: @{username}" if username else "Username: не указан",
-            f"Telegram ID: <code>{telegram_id}</code>" if telegram_id else "Telegram ID: не указан",
+            f"Telegram ID: {telegram_id}" if telegram_id else "Telegram ID: не указан",
             f"Телефон: {phone}",
-            f"Суммарный долг: <b>{total_debt} занятий</b>",
+            f"Суммарный долг: {total_debt} занятий",
             "",
-            "<b>Долг по направлениям:</b>",
+            "Долг по направлениям:",
         ]
         for row in details["directions"][:20]:
             lines.append(f"• {row['subject_name']} — {row['teacher_name']} | долг: {row['debt_lessons']}")
 
         detail_buttons: list[list[InlineKeyboardButton]] = []
-        if telegram_id:
-            detail_buttons.append(
-                [InlineKeyboardButton(text="Открыть чат в Telegram", url=f"tg://user?id={telegram_id}")]
-            )
-        elif username:
-            detail_buttons.append(
-                [InlineKeyboardButton(text="Открыть профиль", url=f"https://t.me/{username}")]
-            )
         detail_buttons.append([InlineKeyboardButton(text="← К списку должников", callback_data="admin_debtors")])
         detail_buttons.append([InlineKeyboardButton(text="Главное меню", callback_data="menu_home")])
 
         await callback.message.answer(
             "\n".join(lines),
-            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=detail_buttons),
         )
-        await callback.answer()
     except Exception as exc:
         logger.exception("admin_debtor_details_v2 failed: %s", exc)
         try:
