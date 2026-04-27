@@ -520,13 +520,29 @@ def get_debtor_details_keyboard(telegram_id: int | None, username: str | None) -
 
 def get_student_contact_keyboard(telegram_id: int | None, username: str | None) -> InlineKeyboardMarkup | None:
     buttons: list[list[InlineKeyboardButton]] = []
+    safe_username = (username or "").strip().lstrip("@")
     if telegram_id:
         buttons.append([InlineKeyboardButton(text="Открыть чат в Telegram", url=f"tg://user?id={telegram_id}")])
-    elif username:
-        buttons.append([InlineKeyboardButton(text="Открыть профиль в Telegram", url=f"https://t.me/{username}")])
+    elif safe_username:
+        buttons.append([InlineKeyboardButton(text="Открыть профиль в Telegram", url=f"https://t.me/{safe_username}")])
     if not buttons:
         return None
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def send_student_contact_shortcut(
+    target: Message,
+    *,
+    telegram_id: int | None,
+    username: str | None,
+) -> None:
+    contact_keyboard = get_student_contact_keyboard(telegram_id, username)
+    if not contact_keyboard:
+        return
+    try:
+        await target.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
+    except Exception as exc:
+        logger.warning("Cannot send student contact shortcut: %s", exc)
 
 
 def can_delete_role(actor_id: int, target_role: str) -> bool:
@@ -1875,7 +1891,12 @@ async def search_student(message: Message, state: FSMContext):
         student_id, full_name, telegram_id, phone, telegram_username = student
         directions = get_student_directions(student_id)
         username_text = f"@{telegram_username}" if telegram_username else "-"
-        contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+        await send_student_contact_shortcut(
+            message,
+            telegram_id=telegram_id,
+            username=telegram_username,
+        )
+        contact_keyboard = None
 
         text = (
             f"👤 <b>{full_name}</b>\n"
@@ -1927,7 +1948,12 @@ async def find_student_pick_from_disambiguation(callback: CallbackQuery):
     _student_id, full_name, telegram_id, phone, telegram_username = student
     directions = get_student_directions(student_id)
     username_text = f"@{telegram_username}" if telegram_username else "-"
-    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+    await send_student_contact_shortcut(
+        callback.message,
+        telegram_id=telegram_id,
+        username=telegram_username,
+    )
+    contact_keyboard = None
 
     text = (
         f"👤 <b>{full_name}</b>\n"
@@ -2116,7 +2142,12 @@ async def attendance_student_search(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+    await send_student_contact_shortcut(
+        message,
+        telegram_id=telegram_id,
+        username=telegram_username,
+    )
+    contact_keyboard = None
     if contact_keyboard:
         await message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
 
@@ -2151,7 +2182,12 @@ async def attendance_pick_student_from_disambiguation(callback: CallbackQuery):
         await callback.answer()
         return
 
-    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+    await send_student_contact_shortcut(
+        callback.message,
+        telegram_id=telegram_id,
+        username=telegram_username,
+    )
+    contact_keyboard = None
     if contact_keyboard:
         await callback.message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
 
@@ -2308,7 +2344,12 @@ async def balance_student_search(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+    await send_student_contact_shortcut(
+        message,
+        telegram_id=telegram_id,
+        username=telegram_username,
+    )
+    contact_keyboard = None
     if contact_keyboard:
         await message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
 
@@ -2352,7 +2393,12 @@ async def balance_pick_student_from_disambiguation(callback: CallbackQuery):
             await callback.answer()
             return
 
-        contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+        await send_student_contact_shortcut(
+            callback.message,
+            telegram_id=telegram_id,
+            username=telegram_username,
+        )
+        contact_keyboard = None
         if contact_keyboard:
             await callback.message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
 
@@ -2536,7 +2582,12 @@ async def show_balance_history(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+    await send_student_contact_shortcut(
+        message,
+        telegram_id=telegram_id,
+        username=telegram_username,
+    )
+    contact_keyboard = None
     if contact_keyboard:
         await message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
 
@@ -2604,7 +2655,12 @@ async def history_pick_student_from_disambiguation(callback: CallbackQuery):
         await callback.answer()
         return
 
-    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+    await send_student_contact_shortcut(
+        callback.message,
+        telegram_id=telegram_id,
+        username=telegram_username,
+    )
+    contact_keyboard = None
     if contact_keyboard:
         await callback.message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
 
