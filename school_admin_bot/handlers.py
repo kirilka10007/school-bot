@@ -2321,37 +2321,56 @@ async def balance_student_search(message: Message, state: FSMContext):
 
 @router.callback_query(lambda c: c.data.startswith("balance_pick_student_"))
 async def balance_pick_student_from_disambiguation(callback: CallbackQuery):
-    if not is_admin_role(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-
     try:
-        student_id = int(callback.data.split("_")[-1])
-    except (TypeError, ValueError):
-        await callback.answer("Не удалось определить ученика", show_alert=True)
-        return
+        if not is_admin_role(callback.from_user.id):
+            await callback.answer("Нет доступа", show_alert=True)
+            return
 
-    student = get_student_by_id_with_username(student_id)
-    if not student:
-        await callback.answer("Ученик не найден", show_alert=True)
-        return
+        try:
+            student_id = int(callback.data.split("_")[-1])
+        except (TypeError, ValueError):
+            await callback.answer("Не удалось определить ученика", show_alert=True)
+            return
 
-    _id, full_name, telegram_id, _phone, telegram_username = student
-    directions = get_student_directions(student_id)
-    if not directions:
-        await callback.message.answer("У этого ученика пока нет направлений.", reply_markup=get_admin_reply_menu(callback.from_user.id))
+        student = get_student_by_id_with_username(student_id)
+        if student:
+            _id, full_name, telegram_id, _phone, telegram_username = student
+        else:
+            fallback_student = get_student_by_id(student_id)
+            if not fallback_student:
+                await callback.answer("Ученик не найден", show_alert=True)
+                return
+            _id, full_name, telegram_id, _phone = fallback_student
+            telegram_username = None
+
+        directions = get_student_directions(student_id)
+        if not directions:
+            await callback.message.answer(
+                "У этого ученика пока нет направлений.",
+                reply_markup=get_admin_reply_menu(callback.from_user.id),
+            )
+            await callback.answer()
+            return
+
+        contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+        if contact_keyboard:
+            await callback.message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
+
+        await callback.message.answer(
+            f"Выбери направление для корректировки баланса ученика {full_name}:",
+            reply_markup=get_balance_direction_keyboard(directions),
+        )
         await callback.answer()
-        return
-
-    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
-    if contact_keyboard:
-        await callback.message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
-
-    await callback.message.answer(
-        f"Выбери направление для корректировки баланса ученика {full_name}:",
-        reply_markup=get_balance_direction_keyboard(directions),
-    )
-    await callback.answer()
+    except Exception as exc:
+        logger.exception("balance_pick_student_from_disambiguation failed: %s", exc)
+        try:
+            await callback.answer("Ошибка при выборе ученика", show_alert=True)
+        except Exception:
+            pass
+        await callback.message.answer(
+            "Не удалось открыть направления для корректировки баланса. Попробуйте ещё раз или отправьте другой запрос.",
+            reply_markup=get_admin_reply_menu(callback.from_user.id) if is_admin_role(callback.from_user.id) else get_main_menu_shortcut_keyboard(),
+        )
 
 
 @router.callback_query(lambda c: c.data.startswith("balance_direction_"))
