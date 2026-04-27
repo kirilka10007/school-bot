@@ -2817,7 +2817,7 @@ async def admin_debtors(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(lambda c: c.data.startswith("admin_debtor_"))
+@router.callback_query(lambda c: c.data.startswith("admin_debtor_legacy_"))
 async def admin_debtor_details(callback: CallbackQuery):
     if not is_admin_role(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
@@ -2866,6 +2866,69 @@ async def admin_debtor_details(callback: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=detail_buttons),
     )
     await callback.answer()
+
+
+@router.callback_query(lambda c: c.data.startswith("admin_debtor_"))
+async def admin_debtor_details_v2(callback: CallbackQuery):
+    try:
+        if not is_admin_role(callback.from_user.id):
+            await callback.answer("Нет доступа", show_alert=True)
+            return
+
+        try:
+            student_id = int(callback.data.split("_")[-1])
+        except (TypeError, ValueError):
+            await callback.answer("Некорректный выбор", show_alert=True)
+            return
+
+        details = get_debtor_student_details(student_id)
+        if not details or not details.get("directions"):
+            await callback.answer("У этого ученика сейчас нет активного долга", show_alert=True)
+            return
+
+        full_name = details.get("full_name") or f"Ученик #{student_id}"
+        username_raw = details.get("telegram_username")
+        username = str(username_raw).strip().lstrip("@") if username_raw else None
+        telegram_id = details.get("telegram_id")
+        total_debt = int(details.get("total_debt_lessons") or 0)
+        phone = details.get("phone") or "-"
+
+        lines = [
+            f"Должник: <b>{full_name}</b>",
+            f"Username: @{username}" if username else "Username: не указан",
+            f"Telegram ID: <code>{telegram_id}</code>" if telegram_id else "Telegram ID: не указан",
+            f"Телефон: {phone}",
+            f"Суммарный долг: <b>{total_debt} занятий</b>",
+            "",
+            "<b>Долг по направлениям:</b>",
+        ]
+        for row in details["directions"][:20]:
+            lines.append(f"• {row['subject_name']} — {row['teacher_name']} | долг: {row['debt_lessons']}")
+
+        detail_buttons: list[list[InlineKeyboardButton]] = []
+        if telegram_id:
+            detail_buttons.append(
+                [InlineKeyboardButton(text="Открыть чат в Telegram", url=f"tg://user?id={telegram_id}")]
+            )
+        elif username:
+            detail_buttons.append(
+                [InlineKeyboardButton(text="Открыть профиль", url=f"https://t.me/{username}")]
+            )
+        detail_buttons.append([InlineKeyboardButton(text="← К списку должников", callback_data="admin_debtors")])
+        detail_buttons.append([InlineKeyboardButton(text="Главное меню", callback_data="menu_home")])
+
+        await callback.message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=detail_buttons),
+        )
+        await callback.answer()
+    except Exception as exc:
+        logger.exception("admin_debtor_details_v2 failed: %s", exc)
+        try:
+            await callback.answer("Ошибка открытия карточки должника", show_alert=True)
+        except Exception:
+            pass
 
 
 @router.message(AdminStates.waiting_delete_user_query)
