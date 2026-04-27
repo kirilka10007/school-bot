@@ -85,6 +85,8 @@ from shared.database import (
     upsert_known_telegram_user,
     create_publication_post,
     create_review_card,
+    get_current_debtors_summary,
+    get_debtor_student_details,
 )
 
 router = Router()
@@ -483,6 +485,35 @@ def format_debt_report_text(report_data: dict, overdue_days: int) -> str:
             )
 
     return "\n".join(lines)
+
+
+def get_debtors_keyboard(debtors: list[dict]) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    for debtor in debtors[:40]:
+        student_id = int(debtor["student_id"])
+        full_name = str(debtor.get("full_name") or f"Ученик #{student_id}")
+        username = debtor.get("telegram_username")
+        total_debt = int(debtor.get("total_debt_lessons") or 0)
+        suffix = f"@{username}" if username else f"ID:{student_id}"
+        text = f"{full_name} | {suffix} | долг: {total_debt}"
+        buttons.append(
+            [InlineKeyboardButton(text=text[:64], callback_data=f"admin_debtor_{student_id}")]
+        )
+
+    buttons.append([InlineKeyboardButton(text="Найти ученика / переименовать", callback_data="admin_find_student")])
+    buttons.append([InlineKeyboardButton(text="Главное меню", callback_data="menu_home")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_debtor_details_keyboard(telegram_id: int | None, username: str | None) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    if telegram_id:
+        buttons.append([InlineKeyboardButton(text="Открыть чат в Telegram", url=f"tg://user?id={telegram_id}")])
+    elif username:
+        buttons.append([InlineKeyboardButton(text="Открыть профиль", url=f"https://t.me/{username}")])
+    buttons.append([InlineKeyboardButton(text="← К списку должников", callback_data="admin_debtors")])
+    buttons.append([InlineKeyboardButton(text="Главное меню", callback_data="menu_home")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def can_delete_role(actor_id: int, target_role: str) -> bool:
@@ -2419,8 +2450,131 @@ async def admin_debt_report(callback: CallbackQuery):
         overdue_days=overdue_days,
     )
     text = format_debt_report_text(report_data, overdue_days)
-    await callback.message.answer(text, parse_mode="HTML")
+    await callback.message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Открыть список должников", callback_data="admin_debtors")],
+                [InlineKeyboardButton(text="Главное меню", callback_data="menu_home")],
+            ]
+        ),
+    )
     await callback.answer("Отчёт сформирован")
+
+
+@router.callback_query(lambda c: c.data == "admin_debtors")
+async def admin_debtors(callback: CallbackQuery):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    debtors = get_current_debtors_summary(limit=200)
+    if not debtors:
+        await callback.message.answer(
+            "Сейчас нет активных должников.",
+            reply_markup=get_main_menu_shortcut_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    duplicate_names: dict[str, int] = {}
+    for item in debtors:
+        full_name = (item.get("full_name") or "").strip()
+        duplicate_names[full_name] = duplicate_names.get(full_name, 0) + 1
+
+    duplicate_lines = [
+        f"• {name} — {count} записей"
+        for name, count in sorted(duplicate_names.items())
+        if name and count > 1
+    ]
+
+    lines = [
+        "Выберите ученика-должника:",
+        "",
+        "В карточке показывается @username или ID, чтобы различать одноимённые записи.",
+    ]
+    if duplicate_lines:
+        lines.extend(
+            [
+                "",
+                "Найдены одинаковые имена:",
+                *duplicate_lines[:10],
+                "",
+                "Рекомендуется уточнить ФИО (например, добавить фамилию/класс).",
+            ]
+        )
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for debtor in debtors[:40]:
+        student_id = int(debtor["student_id"])
+        full_name = str(debtor.get("full_name") or f"Ученик #{student_id}")
+        username = debtor.get("telegram_username")
+        total_debt = int(debtor.get("total_debt_lessons") or 0)
+        suffix = f"@{username}" if username else f"ID:{student_id}"
+        text = f"{full_name} | {suffix} | долг: {total_debt}"
+        buttons.append(
+            [InlineKeyboardButton(text=text[:64], callback_data=f"admin_debtor_{student_id}")]
+        )
+    buttons.append([InlineKeyboardButton(text="Найти ученика / переименовать", callback_data="admin_find_student")])
+    buttons.append([InlineKeyboardButton(text="Главное меню", callback_data="menu_home")])
+
+    await callback.message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data.startswith("admin_debtor_"))
+async def admin_debtor_details(callback: CallbackQuery):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    try:
+        student_id = int(callback.data.split("_")[-1])
+    except ValueError:
+        await callback.answer("Некорректный выбор", show_alert=True)
+        return
+
+    details = get_debtor_student_details(student_id)
+    if not details or not details.get("directions"):
+        await callback.answer("У этого ученика сейчас нет активного долга", show_alert=True)
+        return
+
+    full_name = details.get("full_name") or f"Ученик #{student_id}"
+    username = details.get("telegram_username")
+    telegram_id = details.get("telegram_id")
+    total_debt = int(details.get("total_debt_lessons") or 0)
+    phone = details.get("phone") or "-"
+
+    lines = [
+        f"Должник: <b>{full_name}</b>",
+        f"Username: @{username}" if username else "Username: не указан",
+        f"Telegram ID: <code>{telegram_id}</code>" if telegram_id else "Telegram ID: не указан",
+        f"Телефон: {phone}",
+        f"Суммарный долг: <b>{total_debt} занятий</b>",
+        "",
+        "<b>Долг по направлениям:</b>",
+    ]
+    for row in details["directions"][:20]:
+        lines.append(f"• {row['subject_name']} — {row['teacher_name']} | долг: {row['debt_lessons']}")
+
+    detail_buttons: list[list[InlineKeyboardButton]] = []
+    if telegram_id:
+        detail_buttons.append([InlineKeyboardButton(text="Открыть чат в Telegram", url=f"tg://user?id={telegram_id}")])
+    elif username:
+        detail_buttons.append([InlineKeyboardButton(text="Открыть профиль", url=f"https://t.me/{username}")])
+    detail_buttons.append([InlineKeyboardButton(text="← К списку должников", callback_data="admin_debtors")])
+    detail_buttons.append([InlineKeyboardButton(text="Главное меню", callback_data="menu_home")])
+
+    await callback.message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=detail_buttons),
+    )
+    await callback.answer()
 
 
 @router.message(AdminStates.waiting_delete_user_query)

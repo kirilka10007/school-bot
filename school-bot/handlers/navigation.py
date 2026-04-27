@@ -6,7 +6,6 @@ from aiogram.types import CallbackQuery, Message
 from keyboards import (
     get_main_menu_keyboard,
     get_teacher_subject_keyboard,
-    get_user_type_keyboard,
 )
 from shared.database import get_teacher_catalog_subjects
 from shared.database import (
@@ -135,9 +134,9 @@ async def start_handler(message: Message, state: FSMContext):
         return
     await message.answer(
         "Здравствуйте! Пожалуйста, укажите, кто будет оставлять заявку.",
-        reply_markup=get_user_type_keyboard(),
+        reply_markup=get_main_menu_keyboard(),
     )
-    await state.set_state(ApplicationForm.user_type)
+    await state.set_state(ApplicationForm.menu)
 
 
 @router.message(Command("menu"))

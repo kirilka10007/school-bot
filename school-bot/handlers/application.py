@@ -29,16 +29,29 @@ router.callback_query.filter(F.message.chat.type == "private")
 
 @router.callback_query(ApplicationForm.menu, lambda c: c.data == "menu_signup")
 async def menu_signup(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    user_type = data.get("user_type")
-
     await state.clear()
-    if user_type:
-        await state.update_data(user_type=user_type)
+    await state.set_state(ApplicationForm.user_type)
+    await callback.message.answer("Кто обращается: ученик или родитель? Напишите одним словом.")
 
     await callback.message.answer("Пожалуйста, напишите, как к Вам обращаться.")
-    await state.set_state(ApplicationForm.name)
+    await state.set_state(ApplicationForm.user_type)
     await callback.answer()
+
+
+@router.message(ApplicationForm.user_type)
+async def get_user_type_text(message: Message, state: FSMContext):
+    text = (message.text or "").strip().lower()
+    if "родител" in text:
+        user_type = "Родитель"
+    elif "учен" in text:
+        user_type = "Ученик"
+    else:
+        await message.answer("Пожалуйста, напишите: ученик или родитель.")
+        return
+
+    await state.update_data(user_type=user_type)
+    await message.answer("Пожалуйста, напишите, как к Вам обращаться.")
+    await state.set_state(ApplicationForm.name)
 
 
 @router.callback_query(lambda c: c.data == "back_step")

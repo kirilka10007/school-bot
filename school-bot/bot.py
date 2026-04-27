@@ -1,10 +1,12 @@
 import asyncio
 import contextlib
 import logging
+import os
 import sys
 from collections import defaultdict
-from datetime import date
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand, MenuButtonCommands
@@ -25,6 +27,10 @@ from shared.logging_setup import get_log_settings, setup_logging
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+try:
+    MSK_TZ = ZoneInfo("Europe/Moscow")
+except Exception:
+    MSK_TZ = timezone(timedelta(hours=3))
 
 for router in routers:
     dp.include_router(router)
@@ -32,10 +38,31 @@ for router in routers:
 
 async def debt_reminder_worker(bot: Bot):
     logger = logging.getLogger(__name__)
+    reminder_weekday_raw = os.getenv("SCHOOL_DEBT_REMINDER_WEEKDAY", "0").strip()
+    reminder_hour_raw = os.getenv("SCHOOL_DEBT_REMINDER_HOUR", "10").strip()
+    try:
+        reminder_weekday = min(6, max(0, int(reminder_weekday_raw)))
+    except ValueError:
+        reminder_weekday = 0
+    try:
+        reminder_hour = min(23, max(0, int(reminder_hour_raw)))
+    except ValueError:
+        reminder_hour = 10
+
     while True:
         try:
-            reminder_date = date.today().isoformat()
-            rows = get_debt_rows_for_reminder(reminder_date)
+            now = datetime.now(MSK_TZ)
+            iso_year, iso_week, _ = now.isocalendar()
+            reminder_key = f"{iso_year}-W{iso_week:02d}"
+            schedule_reached = (
+                now.weekday() > reminder_weekday
+                or (now.weekday() == reminder_weekday and now.hour >= reminder_hour)
+            )
+            if not schedule_reached:
+                await asyncio.sleep(3600)
+                continue
+
+            rows = get_debt_rows_for_reminder(reminder_key)
             grouped = defaultdict(list)
 
             for row in rows:
@@ -73,7 +100,7 @@ async def debt_reminder_worker(bot: Bot):
                     continue
 
                 for student_lesson_id, *_ in debts:
-                    mark_debt_reminder_sent(student_lesson_id, reminder_date)
+                    mark_debt_reminder_sent(student_lesson_id, reminder_key)
         except Exception as exc:
             logger.exception("Debt reminder worker error: %s", exc)
 

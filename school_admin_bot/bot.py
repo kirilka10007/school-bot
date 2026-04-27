@@ -97,6 +97,7 @@ async def debt_report_worker():
     logger = logging.getLogger(__name__)
     overdue_days_raw = os.getenv("SCHOOL_DEBT_OVERDUE_DAYS", "7").strip()
     report_hour_raw = os.getenv("SCHOOL_DEBT_REPORT_HOUR", "10").strip()
+    report_weekday_raw = os.getenv("SCHOOL_DEBT_REPORT_WEEKDAY", "1").strip()
 
     try:
         overdue_days = max(1, int(overdue_days_raw))
@@ -107,13 +108,25 @@ async def debt_report_worker():
         report_hour = min(23, max(0, int(report_hour_raw)))
     except ValueError:
         report_hour = 10
+    try:
+        report_weekday = min(6, max(0, int(report_weekday_raw)))
+    except ValueError:
+        report_weekday = 1
 
     while True:
         try:
-            now = datetime.now()
-            report_date = date.today().isoformat()
-            if now.hour >= report_hour and not is_daily_debt_report_sent(report_date):
-                report_data = build_daily_debt_report(report_date=report_date, overdue_days=overdue_days)
+            now = datetime.now(MSK_TZ)
+            iso_year, iso_week, _ = now.isocalendar()
+            report_key = f"{iso_year}-W{iso_week:02d}"
+            schedule_reached = (
+                now.weekday() > report_weekday
+                or (now.weekday() == report_weekday and now.hour >= report_hour)
+            )
+            if schedule_reached and not is_daily_debt_report_sent(report_key):
+                report_data = build_daily_debt_report(
+                    report_date=date.today().isoformat(),
+                    overdue_days=overdue_days,
+                )
                 text = _format_debt_report_text(report_data, overdue_days)
 
                 recipients = sorted(set(list(SUPERADMINS) + get_active_admin_telegram_ids()))
@@ -123,7 +136,7 @@ async def debt_report_worker():
                     except Exception as exc:
                         logger.warning("Debt report send failed for %s: %s", recipient, exc)
 
-                mark_daily_debt_report_sent(report_date)
+                mark_daily_debt_report_sent(report_key)
         except Exception as exc:
             logger.exception("Debt report worker error: %s", exc)
 

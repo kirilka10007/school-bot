@@ -3058,6 +3058,105 @@ def get_debt_rows_for_reminder(reminder_date: str):
     return rows
 
 
+def get_current_debtors_summary(limit: int = 200) -> list[dict]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            s.id,
+            s.full_name,
+            s.telegram_id,
+            s.telegram_username,
+            SUM(ABS(sl.lesson_balance)) AS total_debt_lessons,
+            COUNT(sl.id) AS debt_directions_count
+        FROM student_lessons sl
+        JOIN students s ON s.id = sl.student_id
+        WHERE sl.lesson_balance < 0
+        GROUP BY s.id, s.full_name, s.telegram_id, s.telegram_username
+        ORDER BY total_debt_lessons DESC, s.full_name, s.id
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    result: list[dict] = []
+    for row in rows:
+        result.append(
+            {
+                "student_id": int(row[0]),
+                "full_name": (row[1] or "").strip() or f"Ученик #{int(row[0])}",
+                "telegram_id": int(row[2]) if row[2] is not None else None,
+                "telegram_username": normalize_telegram_username(row[3]),
+                "total_debt_lessons": int(row[4] or 0),
+                "debt_directions_count": int(row[5] or 0),
+            }
+        )
+    return result
+
+
+def get_debtor_student_details(student_id: int) -> dict | None:
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT id, full_name, telegram_id, telegram_username, phone
+        FROM students
+        WHERE id = ?
+        """,
+        (student_id,),
+    )
+    student_row = cur.fetchone()
+    if not student_row:
+        conn.close()
+        return None
+
+    cur.execute(
+        """
+        SELECT
+            sl.id,
+            sl.subject_name,
+            t.full_name,
+            sl.lesson_balance
+        FROM student_lessons sl
+        JOIN teachers t ON t.id = sl.teacher_id
+        WHERE sl.student_id = ?
+          AND sl.lesson_balance < 0
+        ORDER BY ABS(sl.lesson_balance) DESC, sl.id
+        """,
+        (student_id,),
+    )
+    debt_rows = cur.fetchall()
+    conn.close()
+
+    directions: list[dict] = []
+    total_debt_lessons = 0
+    for lesson_id, subject_name, teacher_name, lesson_balance in debt_rows:
+        debt_lessons = abs(int(lesson_balance or 0))
+        total_debt_lessons += debt_lessons
+        directions.append(
+            {
+                "student_lesson_id": int(lesson_id),
+                "subject_name": (subject_name or "").strip() or "-",
+                "teacher_name": (teacher_name or "").strip() or "-",
+                "debt_lessons": debt_lessons,
+            }
+        )
+
+    return {
+        "student_id": int(student_row[0]),
+        "full_name": (student_row[1] or "").strip() or f"Ученик #{int(student_row[0])}",
+        "telegram_id": int(student_row[2]) if student_row[2] is not None else None,
+        "telegram_username": normalize_telegram_username(student_row[3]),
+        "phone": (student_row[4] or "").strip() or None,
+        "total_debt_lessons": total_debt_lessons,
+        "directions": directions,
+    }
+
+
 def search_users_by_name_or_username(
     query: str,
     roles: list[str] | tuple[str, ...] | None = None,
