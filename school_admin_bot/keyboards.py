@@ -304,3 +304,19 @@ def get_teacher_selection_keyboard(
         )
     buttons.append([InlineKeyboardButton(text="Главное меню", callback_data="menu_home")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_student_disambiguation_keyboard(
+    students: list[tuple[int, str, int | None, str | None, str | None]],
+    action_prefix: str,
+):
+    buttons = []
+    for student_id, full_name, telegram_id, _phone, username in students[:30]:
+        uname = f"@{username}" if username else "без username"
+        tg_suffix = f"tg:{telegram_id}" if telegram_id else "tg:-"
+        text = f"{full_name} | {uname} | {tg_suffix}"
+        buttons.append(
+            [InlineKeyboardButton(text=text[:64], callback_data=f"{action_prefix}_{student_id}")]
+        )
+    buttons.append([InlineKeyboardButton(text="Главное меню", callback_data="menu_home")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)

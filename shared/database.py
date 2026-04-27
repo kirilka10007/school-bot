@@ -1332,6 +1332,29 @@ def find_students_by_name(search_text: str):
     return rows
 
 
+def find_students_by_name_with_username(search_text: str):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    normalized_query = (search_text or "").strip().lower().lstrip("@")
+    pattern = f"%{normalized_query}%"
+
+    cur.execute(
+        """
+        SELECT id, full_name, telegram_id, phone, telegram_username
+        FROM students
+        WHERE LOWER(full_name) LIKE ?
+           OR LOWER(COALESCE(telegram_username, '')) LIKE ?
+        ORDER BY full_name
+        """,
+        (pattern, pattern)
+    )
+    rows = cur.fetchall()
+
+    conn.close()
+    return rows
+
+
 def find_teacher_students_by_name(teacher_telegram_id: int, search_text: str):
     conn = get_connection()
     cur = conn.cursor()
@@ -1629,6 +1652,24 @@ def get_student_by_id(student_id: int):
     cur.execute(
         """
         SELECT id, full_name, telegram_id, phone
+        FROM students
+        WHERE id = ?
+        """,
+        (student_id,)
+    )
+    row = cur.fetchone()
+
+    conn.close()
+    return row
+
+
+def get_student_by_id_with_username(student_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT id, full_name, telegram_id, phone, telegram_username
         FROM students
         WHERE id = ?
         """,

@@ -30,6 +30,7 @@ from keyboards import (
     get_main_menu_shortcut_keyboard,
     get_user_selection_keyboard,
     get_teacher_selection_keyboard,
+    get_student_disambiguation_keyboard,
     get_subject_selection_keyboard,
     get_assign_subject_rename_keyboard,
     get_teacher_subject_picker_keyboard,
@@ -43,7 +44,7 @@ from shared.database import (
     get_all_students,
     add_teacher_if_not_exists,
     add_student_lesson,
-    find_students_by_name,
+    find_students_by_name_with_username,
     get_student_directions,
     get_student_lesson_by_id,
     mark_attendance,
@@ -55,6 +56,7 @@ from shared.database import (
     search_users_by_name_or_username,
     get_user_by_id,
     get_student_by_id,
+    get_student_by_id_with_username,
     get_student_by_telegram_id,
     bind_teacher_telegram_id,
     log_admin_action,
@@ -513,6 +515,17 @@ def get_debtor_details_keyboard(telegram_id: int | None, username: str | None) -
         buttons.append([InlineKeyboardButton(text="Открыть профиль", url=f"https://t.me/{username}")])
     buttons.append([InlineKeyboardButton(text="← К списку должников", callback_data="admin_debtors")])
     buttons.append([InlineKeyboardButton(text="Главное меню", callback_data="menu_home")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_student_contact_keyboard(telegram_id: int | None, username: str | None) -> InlineKeyboardMarkup | None:
+    buttons: list[list[InlineKeyboardButton]] = []
+    if telegram_id:
+        buttons.append([InlineKeyboardButton(text="Открыть чат в Telegram", url=f"tg://user?id={telegram_id}")])
+    elif username:
+        buttons.append([InlineKeyboardButton(text="Открыть профиль в Telegram", url=f"https://t.me/{username}")])
+    if not buttons:
+        return None
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -1841,22 +1854,33 @@ async def search_student(message: Message, state: FSMContext):
         return
 
     search_text = message.text.strip()
-    students = find_students_by_name(search_text)
+    students = find_students_by_name_with_username(search_text)
 
     if not students:
         await message.answer("Ничего не найдено.", reply_markup=get_admin_menu())
         await state.clear()
         return
 
+    if len(students) > 1:
+        await message.answer(
+            "Найдено несколько учеников. Выберите нужного:",
+            reply_markup=get_student_disambiguation_keyboard(students, action_prefix="find_student_pick"),
+        )
+        await state.clear()
+        return
+
     result_messages = []
 
     for student in students:
-        student_id, full_name, telegram_id, phone = student
+        student_id, full_name, telegram_id, phone, telegram_username = student
         directions = get_student_directions(student_id)
+        username_text = f"@{telegram_username}" if telegram_username else "-"
+        contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
 
         text = (
             f"👤 <b>{full_name}</b>\n"
             f"🆔 ID: <code>{student_id}</code>\n"
+            f"🔗 Username: <code>{username_text}</code>\n"
             f"📱 Телефон: {phone if phone else '-'}\n"
             f"🔗 Telegram ID: {telegram_id if telegram_id else '-'}\n\n"
         )
@@ -1877,10 +1901,58 @@ async def search_student(message: Message, state: FSMContext):
         result_messages.append(text)
 
     for text in result_messages:
-        await message.answer(text, parse_mode="HTML")
+        await message.answer(text, parse_mode="HTML", reply_markup=contact_keyboard)
 
     await message.answer("Поиск завершен.", reply_markup=get_admin_menu())
     await state.clear()
+
+
+@router.callback_query(lambda c: c.data.startswith("find_student_pick_"))
+async def find_student_pick_from_disambiguation(callback: CallbackQuery):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    try:
+        student_id = int(callback.data.split("_")[-1])
+    except (TypeError, ValueError):
+        await callback.answer("Не удалось определить ученика", show_alert=True)
+        return
+
+    student = get_student_by_id_with_username(student_id)
+    if not student:
+        await callback.answer("Ученик не найден", show_alert=True)
+        return
+
+    _student_id, full_name, telegram_id, phone, telegram_username = student
+    directions = get_student_directions(student_id)
+    username_text = f"@{telegram_username}" if telegram_username else "-"
+    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+
+    text = (
+        f"👤 <b>{full_name}</b>\n"
+        f"🆔 ID: <code>{student_id}</code>\n"
+        f"🔗 Username: <code>{username_text}</code>\n"
+        f"📱 Телефон: {phone if phone else '-'}\n"
+        f"🔗 Telegram ID: {telegram_id if telegram_id else '-'}\n\n"
+    )
+
+    if directions:
+        text += "<b>Направления:</b>\n"
+        for direction in directions:
+            _, teacher_name, subject_name, lesson_balance, tariff_type = direction
+            tariff_text = "Разовое" if tariff_type == "single" else "Пакет"
+            text += (
+                f"• {subject_name} — {teacher_name}\n"
+                f"  Тариф: {tariff_text}\n"
+                f"  Остаток: {lesson_balance}\n"
+            )
+    else:
+        text += "Направлений пока нет."
+
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=contact_keyboard)
+    await callback.message.answer("Поиск завершен.", reply_markup=get_admin_reply_menu(callback.from_user.id))
+    await callback.answer()
 
 
 @router.callback_query(lambda c: c.data == "admin_attendance")
@@ -2021,7 +2093,7 @@ async def attendance_student_search(message: Message, state: FSMContext):
         return
 
     search_text = message.text.strip()
-    students = find_students_by_name(search_text)
+    students = find_students_by_name_with_username(search_text)
 
     if not students:
         await message.answer("Ученик не найден.", reply_markup=get_admin_menu())
@@ -2029,16 +2101,14 @@ async def attendance_student_search(message: Message, state: FSMContext):
         return
 
     if len(students) > 1:
-        lines = ["Найдено несколько учеников:\n"]
-        for index, student in enumerate(students, start=1):
-            student_id, full_name, telegram_id, phone = student
-            lines.append(f"{index}. {full_name} (ID: {student_id})")
-        lines.append("\nУточни запрос точнее.")
-        await message.answer("\n".join(lines), reply_markup=get_admin_menu())
+        await message.answer(
+            "Найдено несколько учеников. Выберите нужного:",
+            reply_markup=get_student_disambiguation_keyboard(students, action_prefix="attendance_pick_student"),
+        )
         await state.clear()
         return
 
-    student_id, full_name, telegram_id, phone = students[0]
+    student_id, full_name, telegram_id, phone, telegram_username = students[0]
     directions = get_student_directions(student_id)
 
     if not directions:
@@ -2046,11 +2116,50 @@ async def attendance_student_search(message: Message, state: FSMContext):
         await state.clear()
         return
 
+    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+    if contact_keyboard:
+        await message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
+
     await message.answer(
         f"Выбери направление для ученика {full_name}:",
         reply_markup=get_attendance_direction_keyboard(directions)
     )
     await state.clear()
+
+
+@router.callback_query(lambda c: c.data.startswith("attendance_pick_student_"))
+async def attendance_pick_student_from_disambiguation(callback: CallbackQuery):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    try:
+        student_id = int(callback.data.split("_")[-1])
+    except (TypeError, ValueError):
+        await callback.answer("Не удалось определить ученика", show_alert=True)
+        return
+
+    student = get_student_by_id_with_username(student_id)
+    if not student:
+        await callback.answer("Ученик не найден", show_alert=True)
+        return
+
+    _id, full_name, telegram_id, _phone, telegram_username = student
+    directions = get_student_directions(student_id)
+    if not directions:
+        await callback.message.answer("У этого ученика пока нет направлений.", reply_markup=get_admin_reply_menu(callback.from_user.id))
+        await callback.answer()
+        return
+
+    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+    if contact_keyboard:
+        await callback.message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
+
+    await callback.message.answer(
+        f"Выбери направление для ученика {full_name}:",
+        reply_markup=get_attendance_direction_keyboard(directions),
+    )
+    await callback.answer()
 
 
 @router.callback_query(lambda c: c.data.startswith("attendance_direction_"))
@@ -2176,7 +2285,7 @@ async def balance_student_search(message: Message, state: FSMContext):
         return
 
     search_text = message.text.strip()
-    students = find_students_by_name(search_text)
+    students = find_students_by_name_with_username(search_text)
 
     if not students:
         await message.answer("Ученик не найден.", reply_markup=get_admin_menu())
@@ -2184,16 +2293,14 @@ async def balance_student_search(message: Message, state: FSMContext):
         return
 
     if len(students) > 1:
-        lines = ["Найдено несколько учеников:\n"]
-        for index, student in enumerate(students, start=1):
-            student_id, full_name, telegram_id, phone = student
-            lines.append(f"{index}. {full_name} (ID: {student_id})")
-        lines.append("\nУточни запрос точнее.")
-        await message.answer("\n".join(lines), reply_markup=get_admin_menu())
+        await message.answer(
+            "Найдено несколько учеников. Выберите нужного:",
+            reply_markup=get_student_disambiguation_keyboard(students, action_prefix="balance_pick_student"),
+        )
         await state.clear()
         return
 
-    student_id, full_name, telegram_id, phone = students[0]
+    student_id, full_name, telegram_id, phone, telegram_username = students[0]
     directions = get_student_directions(student_id)
 
     if not directions:
@@ -2201,11 +2308,50 @@ async def balance_student_search(message: Message, state: FSMContext):
         await state.clear()
         return
 
+    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+    if contact_keyboard:
+        await message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
+
     await message.answer(
         f"Выбери направление для корректировки баланса ученика {full_name}:",
         reply_markup=get_balance_direction_keyboard(directions)
     )
     await state.clear()
+
+
+@router.callback_query(lambda c: c.data.startswith("balance_pick_student_"))
+async def balance_pick_student_from_disambiguation(callback: CallbackQuery):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    try:
+        student_id = int(callback.data.split("_")[-1])
+    except (TypeError, ValueError):
+        await callback.answer("Не удалось определить ученика", show_alert=True)
+        return
+
+    student = get_student_by_id_with_username(student_id)
+    if not student:
+        await callback.answer("Ученик не найден", show_alert=True)
+        return
+
+    _id, full_name, telegram_id, _phone, telegram_username = student
+    directions = get_student_directions(student_id)
+    if not directions:
+        await callback.message.answer("У этого ученика пока нет направлений.", reply_markup=get_admin_reply_menu(callback.from_user.id))
+        await callback.answer()
+        return
+
+    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+    if contact_keyboard:
+        await callback.message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
+
+    await callback.message.answer(
+        f"Выбери направление для корректировки баланса ученика {full_name}:",
+        reply_markup=get_balance_direction_keyboard(directions),
+    )
+    await callback.answer()
 
 
 @router.callback_query(lambda c: c.data.startswith("balance_direction_"))
@@ -2348,7 +2494,7 @@ async def show_balance_history(message: Message, state: FSMContext):
         return
 
     search_text = message.text.strip()
-    students = find_students_by_name(search_text)
+    students = find_students_by_name_with_username(search_text)
 
     if not students:
         await message.answer("Ученик не найден.", reply_markup=get_admin_menu())
@@ -2356,22 +2502,24 @@ async def show_balance_history(message: Message, state: FSMContext):
         return
 
     if len(students) > 1:
-        lines = ["Найдено несколько учеников:\n"]
-        for index, student in enumerate(students, start=1):
-            student_id, full_name, telegram_id, phone = student
-            lines.append(f"{index}. {full_name} (ID: {student_id})")
-        lines.append("\nУточни запрос точнее.")
-        await message.answer("\n".join(lines), reply_markup=get_admin_menu())
+        await message.answer(
+            "Найдено несколько учеников. Выберите нужного:",
+            reply_markup=get_student_disambiguation_keyboard(students, action_prefix="history_pick_student"),
+        )
         await state.clear()
         return
 
-    student_id, full_name, telegram_id, phone = students[0]
+    student_id, full_name, telegram_id, phone, telegram_username = students[0]
     history_rows = get_balance_history_by_student(student_id)
 
     if not history_rows:
         await message.answer("История операций пока пустая.", reply_markup=get_admin_menu())
         await state.clear()
         return
+
+    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+    if contact_keyboard:
+        await message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
 
     chunks = []
     current_chunk = [f"📘 <b>История баланса</b>\n\n👤 <b>{full_name}</b>\n"]
@@ -2411,6 +2559,74 @@ async def show_balance_history(message: Message, state: FSMContext):
 
     await message.answer("История показана.", reply_markup=get_admin_menu())
     await state.clear()
+
+
+@router.callback_query(lambda c: c.data.startswith("history_pick_student_"))
+async def history_pick_student_from_disambiguation(callback: CallbackQuery):
+    if not is_admin_role(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    try:
+        student_id = int(callback.data.split("_")[-1])
+    except (TypeError, ValueError):
+        await callback.answer("Не удалось определить ученика", show_alert=True)
+        return
+
+    student = get_student_by_id_with_username(student_id)
+    if not student:
+        await callback.answer("Ученик не найден", show_alert=True)
+        return
+
+    _id, full_name, telegram_id, _phone, telegram_username = student
+    history_rows = get_balance_history_by_student(student_id)
+    if not history_rows:
+        await callback.message.answer("История операций пока пустая.", reply_markup=get_admin_reply_menu(callback.from_user.id))
+        await callback.answer()
+        return
+
+    contact_keyboard = get_student_contact_keyboard(telegram_id, telegram_username)
+    if contact_keyboard:
+        await callback.message.answer("Быстрый переход в чат с учеником:", reply_markup=contact_keyboard)
+
+    chunks = []
+    current_chunk = [f"📘 <b>История баланса</b>\n\n👤 <b>{full_name}</b>\n"]
+
+    for row in history_rows:
+        _, _student_name, teacher_name, subject_name, operation_type, lessons_delta, comment, created_at, created_by = row
+
+        if operation_type == "manual_topup":
+            op_text = "Начисление"
+        elif operation_type == "attendance_writeoff":
+            op_text = "Списание за посещение"
+        else:
+            op_text = operation_type
+
+        sign = "+" if lessons_delta > 0 else ""
+
+        entry = (
+            f"\n📅 <b>{created_at}</b>\n"
+            f"📚 {subject_name} — {teacher_name}\n"
+            f"🧾 {op_text}\n"
+            f"🔢 {sign}{lessons_delta}\n"
+            f"💬 {comment if comment else '-'}\n"
+            f"👨‍💼 ID кто сделал: {created_by if created_by else '-'}\n"
+        )
+
+        current_chunk.append(entry)
+
+        if sum(len(x) for x in current_chunk) > 3000:
+            chunks.append("".join(current_chunk))
+            current_chunk = []
+
+    if current_chunk:
+        chunks.append("".join(current_chunk))
+
+    for chunk in chunks:
+        await callback.message.answer(chunk, parse_mode="HTML")
+
+    await callback.message.answer("История показана.", reply_markup=get_admin_reply_menu(callback.from_user.id))
+    await callback.answer()
 
 
 @router.callback_query(lambda c: c.data == "admin_delete_user")
